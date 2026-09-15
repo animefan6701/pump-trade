@@ -1,0 +1,16 @@
+.env
+.env.*
+!.env.example
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+models/*.json
+models/*.txt
+models/*.pkl
+vendor/
+data/
+data/*.pkl
+web/node_modules/
+web/.next/
+web/tsconfig.tsbuildinfo
