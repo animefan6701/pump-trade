@@ -1,7 +1,19 @@
 import { MongoClient, type Db } from "mongodb";
 import { config as loadEnv } from "dotenv";
 import { resolve } from "path";
-import type { CoinDoc, CurveOutcomeDoc, IngestJobDoc, PositionDoc, ScoreDoc, TradeDoc, TraderSettings } from "./types";
+import type {
+  BlacklistDoc,
+  WatchPinDoc,
+  CoinDoc,
+  CurveOutcomeDoc,
+  ApiKeyDoc,
+  IngestJobDoc,
+  MigrateSeriesDoc,
+  PositionDoc,
+  ScoreDoc,
+  TradeDoc,
+  TraderSettings,
+} from "./types";
 
 loadEnv({ path: resolve(process.cwd(), "../.env") });
 loadEnv({ path: resolve(process.cwd(), ".env") });
@@ -45,4 +57,20 @@ export async function positions() {
 
 export async function traderSettings() {
   return (await getDb()).collection<TraderSettings & { _id: string }>("trader");
+}
+
+export async function migrateSeries() {
+  return (await getDb()).collection<MigrateSeriesDoc>("migrate_series");
+}
+
+export async function apiKeys() {
+  return (await getDb()).collection<ApiKeyDoc>("api_keys");
+}
+
+export async function blacklist() {
+  return (await getDb()).collection<BlacklistDoc>("blacklist");
+}
+
+export async function watchPins() {
+  return (await getDb()).collection<WatchPinDoc>("watch_pins");
 }

@@ -1,5 +1,17 @@
+import { blacklistMints } from "./blacklist";
 import { coins, jobs, scores } from "./mongo";
 import { enrichMeltLive } from "./meltLive";
+import {
+  attachGeckoToPairs,
+  captureMissingLaunchTapes,
+  fetchGeckoPools,
+  isVirtualBook,
+  needsLaunchTape,
+  pairScore,
+  pumpCurveReserve,
+  type DexPair,
+} from "./tape";
+import { fetchMoonLaunches } from "./moonIngest";
 import { scoreAndUpsert } from "./upsert";
 import type { IngestJobDoc, LaunchSnapshot } from "./types";
 
@@ -35,7 +47,11 @@ function intervalMs() {
 
 async function getJson(url: string, headers: Record<string, string> = {}) {
   const r = await fetch(url, {
-    headers: { accept: "application/json", ...headers },
+    headers: {
+      accept: "application/json",
+      "user-agent": "Mozilla/5.0 (compatible; pump-trade-desk/1.0)",
+      ...headers,
+    },
     cache: "no-store",
     signal: AbortSignal.timeout(20_000),
   });
@@ -71,6 +87,7 @@ function pumpSnap(row: Record<string, unknown>): LaunchSnapshot | null {
     })(),
     athMarketCap: Number(row.ath_market_cap || 0) || undefined,
     realSolReserves: Number(row.real_sol_reserves || row.real_quote_reserves || 0),
+    reserveUsd: pumpCurveReserve(row),
     launchedAt: created ? new Date(created).toISOString() : undefined,
     poolAddress: row.pool_address ? String(row.pool_address) : row.bonding_curve ? String(row.bonding_curve) : undefined,
     tokenProgram: row.token_program ? String(row.token_program) : undefined,
@@ -155,10 +172,18 @@ export async function fetchNewLaunches(): Promise<{
     geckoRows = [];
   }
 
+  let moonRows: LaunchSnapshot[] = [];
+  try {
+    moonRows = (await fetchMoonLaunches({ backfillMin: 45 })).snaps;
+  } catch {
+    moonRows = [];
+  }
+
+  const blocked = await blacklistMints();
   const seen = new Set<string>();
   const snaps: LaunchSnapshot[] = [];
-  for (const snap of [...pumpRows, ...geckoRows]) {
-    if (seen.has(snap.mint)) continue;
+  for (const snap of [...pumpRows, ...moonRows, ...geckoRows]) {
+    if (blocked.has(snap.mint) || seen.has(snap.mint)) continue;
     seen.add(snap.mint);
     snaps.push(snap);
   }
@@ -169,7 +194,7 @@ export async function fetchNewLaunches(): Promise<{
 
   return {
     snaps,
-    sources: { pumpfun: pumpRows.length, geckoterminal: geckoRows.length },
+    sources: { pumpfun: pumpRows.length, moonshot: moonRows.length, geckoterminal: geckoRows.length },
   };
 }
 
@@ -178,18 +203,6 @@ async function enrichDexscreener(snaps: LaunchSnapshot[]) {
   for (let i = 0; i < mints.length; i += 25) {
     const chunk = mints.slice(i, i + 25);
     try {
-      type DexPair = {
-        chainId?: string;
-        pairAddress?: string;
-        priceUsd?: string;
-        fdv?: number;
-        marketCap?: number;
-        liquidity?: { usd?: number };
-        volume?: { m5?: number; h1?: number };
-        priceChange?: { m5?: number; h1?: number };
-        txns?: { m5?: { buys?: number; sells?: number }; h1?: { buys?: number; sells?: number } };
-        baseToken?: { address?: string };
-      };
       const body = (await getJson(`https://api.dexscreener.com/latest/dex/tokens/${chunk.join(",")}`)) as {
         pairs?: DexPair[];
       };
@@ -199,19 +212,32 @@ async function enrichDexscreener(snaps: LaunchSnapshot[]) {
         const mint = p.baseToken?.address;
         if (!mint) continue;
         const prev = best.get(mint);
-        if (!prev || (p.liquidity?.usd || 0) > (prev.liquidity?.usd || 0)) best.set(mint, p);
+        if (!prev || pairScore(p) > pairScore(prev)) best.set(mint, p);
       }
+      const thin = [...best.entries()].filter(([, p]) => Number(p.liquidity?.usd || 0) < 80);
+      await Promise.all(
+        thin.slice(0, 8).map(async ([mint, p]) => {
+          attachGeckoToPairs([p], await fetchGeckoPools(mint));
+          best.set(mint, p);
+        }),
+      );
       for (const snap of snaps) {
         const p = best.get(snap.mint);
         if (!p) continue;
-        snap.poolAddress = snap.poolAddress || p.pairAddress;
+        snap.poolAddress = p.pairAddress || snap.poolAddress;
         if (p.priceUsd) snap.priceUsd = Number(p.priceUsd);
-        if (!snap.usdMarketCap) snap.usdMarketCap = p.marketCap || p.fdv;
-        snap.reserveUsd = snap.reserveUsd ?? p.liquidity?.usd;
+        const virtual = isVirtualBook(p);
+        const liq = Number(p.liquidity?.usd || 0);
+        if (!virtual) {
+          snap.dex = p.dexId || snap.dex;
+          if (liq > 0) snap.reserveUsd = liq;
+          snap.usdMarketCap = liq >= 80 ? p.marketCap || p.fdv || snap.usdMarketCap : p.marketCap || p.fdv || snap.usdMarketCap;
+        }
         snap.volume5m = snap.volume5m ?? p.volume?.m5;
         snap.volume1h = p.volume?.h1;
         snap.change5m = snap.change5m ?? p.priceChange?.m5;
         snap.change1h = p.priceChange?.h1;
+        snap.change6h = p.priceChange?.h6;
         const m5 = p.txns?.m5;
         if (m5) {
           snap.buys5m = snap.buys5m ?? m5.buys;
@@ -301,6 +327,41 @@ export async function runIngestCycle(): Promise<IngestJobDoc> {
   try {
     const { snaps, sources } = await fetchNewLaunches();
     result.sources = sources;
+
+    const needTape: LaunchSnapshot[] = [];
+    for (const snap of snaps) {
+      const existing = await col.findOne(
+        { mint: snap.mint },
+        {
+          projection: {
+            source: 1,
+            launchSnipers: 1,
+            complete: 1,
+            migrateAt: 1,
+            launchedAt: 1,
+            launchTapeAt: 1,
+            tapeTries: 1,
+            nextTapeAt: 1,
+          },
+        },
+      );
+      if (existing?.source === "melt") continue;
+      if (needsLaunchTape(existing)) {
+        snap.tapeTries = existing?.tapeTries;
+        snap.launchTapeAt = existing?.launchTapeAt;
+        snap.nextTapeAt = existing?.nextTapeAt;
+        needTape.push(snap);
+      }
+    }
+    const taped = await captureMissingLaunchTapes(needTape, 8, 3);
+    result.sources = {
+      ...sources,
+      tape: taped.tried,
+      tapeTrades: taped.trades,
+      tapeSnipers: taped.snipers,
+      tapePump: taped.pump,
+      tapeHelius: taped.helius,
+    };
 
     for (const snap of snaps) {
       const existing = await col.findOne({ mint: snap.mint });

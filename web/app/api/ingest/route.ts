@@ -1,23 +1,39 @@
 import { NextResponse } from "next/server";
 import { getCalibrateStatus, runCalibration } from "@/lib/calibrate";
 import { getIngestStatus, intervalMs, runIngestCycle } from "@/lib/ingest";
-import { getLiveStatus, liveMs, runLivePumpCycle } from "@/lib/liveIngest";
+import { getLiveStatus, getNewestStatus, liveMs, newestMs, runLivePumpCycle } from "@/lib/liveIngest";
+import { getMoonStatus, moonMs } from "@/lib/moonIngest";
+import { fullRescoreIntervalMs, getFullRescoreStatus, getRescoreStatus, rescoreIntervalMs } from "@/lib/rescoreRejected";
+import { startIngestScheduler } from "@/lib/scheduler";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 180;
 
 export async function GET() {
-  const [job, live, cal] = await Promise.all([
+  startIngestScheduler();
+  const [job, live, newest, moon, cal, rescore, rescoreFull] = await Promise.all([
     getIngestStatus(),
     getLiveStatus(),
+    getNewestStatus(),
+    getMoonStatus(),
     getCalibrateStatus(),
+    getRescoreStatus(),
+    getFullRescoreStatus(),
   ]);
   return NextResponse.json({
     job,
     live,
+    newest,
+    moon,
     cal,
+    rescore,
+    rescoreFull,
     intervalMs: intervalMs(),
     liveMs: liveMs(),
+    newestMs: newestMs(),
+    moonMs: moonMs(),
+    rescoreMs: rescoreIntervalMs(),
+    fullRescoreMs: fullRescoreIntervalMs(),
   });
 }
 

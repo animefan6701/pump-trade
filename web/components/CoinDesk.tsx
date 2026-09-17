@@ -2,8 +2,12 @@
 
 import { useEffect, useState } from "react";
 import Link from "next/link";
+import { useRouter } from "next/navigation";
+import { BanButton } from "@/components/BanButton";
+import { PinButton } from "@/components/PinButton";
 import { VenueLinks } from "@/components/VenueLinks";
-import type { CoinDoc, CoinStatus, TradeDoc } from "@/lib/types";
+import { isDir5mFlag, isDumpFirstFlag, isHit15xFlag, isHit2xFlag, isManipFlag, isSurvive70Flag } from "@/lib/flags";
+import type { CoinDoc, TradeDoc } from "@/lib/types";
 
 function pct(n: number) {
   return `${Math.round(100 * n)}%`;
@@ -24,6 +28,7 @@ function Bar({ value, color }: { value: number; color: string }) {
 }
 
 export function CoinDesk({ mint }: { mint: string }) {
+  const router = useRouter();
   const [coin, setCoin] = useState<CoinDoc | null>(null);
   const [fills, setFills] = useState<TradeDoc[]>([]);
   const [busy, setBusy] = useState(false);
@@ -57,6 +62,8 @@ export function CoinDesk({ mint }: { mint: string }) {
 
   useEffect(() => {
     void load();
+    const poll = window.setInterval(() => void load(), 1_000);
+    return () => window.clearInterval(poll);
   }, [mint]);
 
   if (error) {
@@ -109,7 +116,13 @@ export function CoinDesk({ mint }: { mint: string }) {
     );
   }
 
-  const flags: CoinStatus[] = coin.flags && coin.flags.length ? coin.flags : [coin.status];
+  const flags: string[] = coin.flags && coin.flags.length ? [...coin.flags] : [coin.status];
+  if (isManipFlag(coin)) flags.push("manip");
+  if (isDir5mFlag(coin)) flags.push("up5m");
+  if (isHit2xFlag(coin)) flags.push("x2");
+  if (isDumpFirstFlag(coin)) flags.push("dump1st");
+  if (isSurvive70Flag(coin)) flags.push("hold70");
+  if (isHit15xFlag(coin)) flags.push("hit15x");
 
   return (
     <main style={{ minHeight: "100vh", padding: "28px 32px 64px" }}>
@@ -128,11 +141,19 @@ export function CoinDesk({ mint }: { mint: string }) {
         {coin.name || coin.symbol || coin.status.toUpperCase()}
       </h1>
       <p style={{ color: "var(--mute)", margin: 0 }}>
-        {flags.map((f) => f.toUpperCase()).join(" · ")} · {coin.symbol || "—"} · {coin.venue}
+        {flags.map((f) => (f === "dump1st" ? "DUMP1st" : f === "hit15x" ? "HIT15x" : f === "hold70" ? "HOLD70" : f.toUpperCase())).join(" · ")} · {coin.symbol || "—"} · {coin.venue}
         {coin.source === "live" ? " · LIVE SCORE" : " · MELT ARCHIVE"}
       </p>
       <p style={{ color: "var(--mute)", wordBreak: "break-all", maxWidth: 720 }}>{coin.mint}</p>
       <div style={{ marginTop: 14, display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+        <PinButton mint={coin.mint} symbol={coin.symbol} />
+        <BanButton mint={coin.mint} symbol={coin.symbol} onBanned={() => router.push("/")} />
+        <Link href="/watch" style={{ color: "var(--acid)", letterSpacing: "0.1em", fontSize: 11 }}>
+          WATCH LIST →
+        </Link>
+        <Link href="/keys" style={{ color: "var(--acid)", letterSpacing: "0.1em", fontSize: 11 }}>
+          KEYS →
+        </Link>
         <button
           type="button"
           disabled={scoring}
@@ -217,7 +238,15 @@ export function CoinDesk({ mint }: { mint: string }) {
             ))}
           </ul>
           <p style={{ color: "var(--mute)", fontSize: 12 }}>
-            venue {coin.venue} · source {coin.source} · manipulated {coin.manipulated}
+            venue {coin.venue} · source {coin.source}
+            {isManipFlag(coin)
+              ? ` · MANIP ${typeof coin.manipScore === "number" ? Math.round(coin.manipScore * 100) + "%" : "yes"}`
+              : ""}
+            {typeof coin.dir5mProb === "number" ? ` · UP5M ${Math.round(coin.dir5mProb * 100)}%` : ""}
+            {typeof coin.hit2xProb === "number" ? ` · X2 ${Math.round(coin.hit2xProb * 100)}%` : ""}
+            {typeof coin.dumpFirstProb === "number" ? ` · DUMP1st ${Math.round(coin.dumpFirstProb * 100)}%` : ""}
+            {typeof coin.survive70Prob === "number" ? ` · HOLD70 ${Math.round(coin.survive70Prob * 100)}%` : ""}
+            {typeof coin.hit15xProb === "number" ? ` · HIT15x ${Math.round(coin.hit15xProb * 100)}%` : ""}
           </p>
         </div>
         <div style={{ border: "1px solid var(--acid)", padding: 18 }}>

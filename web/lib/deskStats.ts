@@ -1,3 +1,4 @@
+import { notBlacklistedMongo } from "./blacklist";
 import { coins, trades } from "./mongo";
 import { bumpDeskStats, emptyDeskStats, type DeskStats } from "./deskStatsShared";
 import type { CoinStatus } from "./types";
@@ -38,7 +39,7 @@ export async function refreshDeskStats(): Promise<DeskStats> {
     const [agg, paper] = await Promise.all([
       col
         .aggregate<{ total: { n: number }[]; flags: { _id: string; n: number }[] }>([
-          { $match: { source: "live" } },
+          { $match: { source: "live", ...(await notBlacklistedMongo()) } },
           {
             $facet: {
               total: [{ $count: "n" }],

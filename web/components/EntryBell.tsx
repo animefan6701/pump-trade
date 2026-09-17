@@ -2,8 +2,8 @@
 
 import { useEffect, useRef, useState } from "react";
 import { VenueLinks } from "@/components/VenueLinks";
-import type { EntryNotice } from "@/lib/entryNotices";
-import { scorePct, unreadCount } from "@/lib/entryNotices";
+import type { EntryNotice, NoticeKind } from "@/lib/entryNotices";
+import { dumpLine, scorePct, unreadCount } from "@/lib/entryNotices";
 import { venueLinks } from "@/lib/venues";
 
 function ago(at: string): string {
@@ -28,6 +28,9 @@ function ScoreLine({ n }: { n: EntryNotice }) {
       <span style={{ color: "var(--rust)" }}>RUG {scorePct(n.rugProb)}</span>
       <span style={{ color: "var(--acid)" }}>ENTRY {scorePct(n.entryProb)}</span>
       <span style={{ color: "var(--amber)" }}>EXIT {scorePct(n.exitProb)}</span>
+      {n.kind === "dump" && (
+        <span style={{ color: "var(--rust)" }}>{dumpLine(n)}</span>
+      )}
     </span>
   );
 }
@@ -47,7 +50,7 @@ export function EntryBell({
   onClose: () => void;
   onRead: (mint: string) => void;
   onReadAll: () => void;
-  onSelect: (mint: string) => void;
+  onSelect: (mint: string, kind?: NoticeKind) => void;
 }) {
   const unread = unreadCount(items);
   const box = useRef<HTMLDivElement>(null);
@@ -68,13 +71,13 @@ export function EntryBell({
       <button
         type="button"
         onClick={onToggle}
-        aria-label={unread ? `${unread} unread entry prints` : "entry notices"}
+        aria-label={unread ? `${unread} unread prints` : "entry and dump notices"}
         style={{
           position: "relative",
           border: "1px solid",
-          borderColor: unread ? "var(--acid)" : "var(--line)",
-          background: unread ? "rgba(214,255,63,0.08)" : "transparent",
-          color: unread ? "var(--acid)" : "var(--paper)",
+            borderColor: unread ? "var(--amber)" : "var(--line)",
+          background: unread ? "rgba(232,168,56,0.1)" : "transparent",
+          color: unread ? "var(--amber)" : "var(--paper)",
           width: 42,
           height: 42,
           cursor: "pointer",
@@ -133,7 +136,7 @@ export function EntryBell({
               letterSpacing: "0.12em",
             }}
           >
-            <span>ENTRY PRINTS</span>
+            <span>ENTRY / DUMP</span>
             <span style={{ display: "flex", gap: 10 }}>
               {typeof Notification !== "undefined" && perm !== "granted" && (
                 <button
@@ -162,7 +165,7 @@ export function EntryBell({
           </div>
           {items.length === 0 && (
             <p style={{ padding: 16, color: "var(--mute)", fontSize: 12, margin: 0 }}>
-              No new ENTRY flags since this desk opened. Pulls will land here.
+              No ENTRY or DUMP flags since this desk opened.
             </p>
           )}
           {items.map((n) => (
@@ -172,7 +175,11 @@ export function EntryBell({
                 width: "100%",
                 textAlign: "left",
                 borderTop: "1px solid var(--line)",
-                background: n.read ? "transparent" : "rgba(214,255,63,0.06)",
+                background: n.read
+                  ? "transparent"
+                  : n.kind === "dump"
+                    ? "rgba(196,74,58,0.1)"
+                    : "rgba(214,255,63,0.06)",
                 padding: "11px 12px",
               }}
             >
@@ -180,12 +187,13 @@ export function EntryBell({
                 type="button"
                 onClick={() => {
                   onRead(n.mint);
-                  onSelect(n.mint);
+                  onSelect(n.mint, n.kind);
                 }}
                 style={{ all: "unset", display: "block", width: "100%", cursor: "pointer" }}
               >
-                <span style={{ color: n.read ? "var(--paper)" : "var(--acid)", fontSize: 13 }}>
+                <span style={{ color: n.read ? "var(--paper)" : n.kind === "dump" ? "var(--rust)" : "var(--acid)", fontSize: 13 }}>
                   {n.read ? "" : "● "}
+                  {n.kind === "dump" ? "DUMP " : "ENTRY "}
                   {n.symbol}
                 </span>
                 <ScoreLine n={n} />
@@ -203,7 +211,7 @@ export function EntryBell({
                     window.open(hrefs.pumpfun, "_blank", "noopener,noreferrer");
                     window.open(hrefs.gmgn, "_blank", "noopener,noreferrer");
                     window.open(hrefs.axiom, "_blank", "noopener,noreferrer");
-                    onSelect(n.mint);
+                    onSelect(n.mint, n.kind);
                   }}
                   style={{
                     all: "unset",

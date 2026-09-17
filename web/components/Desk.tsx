@@ -3,17 +3,26 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { EntryBell } from "@/components/EntryBell";
+import { BanButton } from "@/components/BanButton";
+import { PinButton } from "@/components/PinButton";
 import { VenueLinks } from "@/components/VenueLinks";
+import { loadWatchlist, syncWatchPins, type WatchItem } from "@/lib/watchlist";
+import { isDumpedCoin } from "@/lib/dumpCheck";
 import {
+  dumpLine,
   emptyNotices,
   loadNotices,
+  pushDumps,
+  isLiveEnter,
   pushEntries,
   saveNotices,
   scorePct,
   type EntryNotice,
+  type NoticeKind,
   type NoticeStore,
 } from "@/lib/entryNotices";
 import { changeTone, holders, launchedAgo, money, price, signedPct } from "@/lib/format";
+import { flagsOf, hasFlag as coinHasFlag, isDir5mFlag, isDumpFirstFlag, isHit15xFlag, isHit2xFlag, isManipFlag, isSurvive70Flag } from "@/lib/flags";
 import { defaultDirFor, type CoinSortField, type SortDir } from "@/lib/sort";
 import type { CoinDoc, CoinStatus, IngestJobDoc, TapeCandle, TapeTrade, TraderSettings } from "@/lib/types";
 import { venueLinks } from "@/lib/venues";
@@ -42,12 +51,15 @@ type TapePayload = {
 };
 
 const PAGE_SIZE = 25;
-const POLL_MS = 12_000;
+const POLL_MS = 1_000;
 const GRID =
-  "110px 100px 78px 88px 68px 64px 56px 64px 58px 52px 52px 52px 248px";
+  "110px 100px 78px 88px 68px 64px 56px 64px 58px 52px 52px 52px 292px";
 
-const FILTERS: { id: "all" | CoinStatus; label: string }[] = [
+type DeskTab = "all" | "watchlist" | CoinStatus;
+
+const FILTERS: { id: DeskTab; label: string }[] = [
   { id: "all", label: "ALL PRINTS" },
+  { id: "watchlist", label: "WATCH LIST" },
   { id: "rejected", label: "RUG / SKIP" },
   { id: "watching", label: "WATCH" },
   { id: "enter", label: "ENTRY" },
@@ -74,25 +86,40 @@ function pct(n: number) {
   return `${Math.round(100 * n)}%`;
 }
 
+function keepOpenRow(incoming: CoinDoc[], prev: CoinDoc[], open: string | null): CoinDoc[] {
+  if (!open) return incoming;
+  if (incoming.some((r) => r.mint === open)) return incoming;
+  const held = prev.find((r) => r.mint === open);
+  return held ? [held, ...incoming] : incoming;
+}
+
 function tone(flag: string) {
   if (flag === "rejected") return "var(--rust)";
   if (flag === "enter") return "var(--acid)";
   if (flag === "exit") return "var(--amber)";
   if (flag === "migrated") return "var(--mint)";
+  if (flag === "manip") return "var(--amber)";
+  if (flag === "up5m") return "var(--acid)";
+  if (flag === "x2") return "var(--mint)";
+  if (flag === "dump1st") return "var(--rust)";
+  if (flag === "hold70") return "var(--mint)";
+  if (flag === "hit15x") return "var(--acid)";
   return "var(--paper)";
 }
 
-function rowFlags(row: CoinDoc): CoinStatus[] {
-  if (row.flags && row.flags.length) return row.flags;
-  if (row.status === "rejected") return ["rejected"];
-  const flags: CoinStatus[] = row.status === "migrated" ? [] : [row.status];
-  if (row.complete || row.status === "migrated") flags.push("migrated");
-  if (flags.length === 0) flags.push("watching");
+function rowFlags(row: CoinDoc): string[] {
+  const flags: string[] = [...flagsOf(row)];
+  if (isManipFlag(row)) flags.push("manip");
+  if (isDir5mFlag(row)) flags.push("up5m");
+  if (isHit2xFlag(row)) flags.push("x2");
+  if (isDumpFirstFlag(row)) flags.push("dump1st");
+  if (isSurvive70Flag(row)) flags.push("hold70");
+  if (isHit15xFlag(row)) flags.push("hit15x");
   return flags;
 }
 
 function hasFlag(row: CoinDoc, flag: string) {
-  return rowFlags(row).includes(flag as CoinStatus);
+  return coinHasFlag(row, flag as CoinStatus);
 }
 
 function bumpDeskStats(cur: Stats | null, from: CoinStatus | undefined, to: CoinStatus, inserted = false) {
@@ -278,7 +305,15 @@ function TokenChart({ candles, trades }: { candles: TapeCandle[]; trades: TapeTr
   );
 }
 
-function TokenAccordion({ mint, onScored }: { mint: string; onScored: (coin: CoinDoc) => void }) {
+function TokenAccordion({
+  mint,
+  onScored,
+  onWatchChange,
+}: {
+  mint: string;
+  onScored: (coin: CoinDoc) => void;
+  onWatchChange?: (items: WatchItem[]) => void;
+}) {
   const [tape, setTape] = useState<TapePayload | null>(null);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
@@ -289,7 +324,7 @@ function TokenAccordion({ mint, onScored }: { mint: string; onScored: (coin: Coi
     setError("");
     (async () => {
       try {
-        const r = await fetch(`/api/coins/${mint}/tape`, { cache: "no-store" });
+        const r = await fetch(`/api/coins/${mint}/tape?view=1`, { cache: "no-store" });
         const body = await r.json();
         if (dead) return;
         if (!r.ok) throw new Error(body.error || "tape failed");
@@ -395,6 +430,7 @@ function TokenAccordion({ mint, onScored }: { mint: string; onScored: (coin: Coi
               {r}
             </span>
           ))}
+          <PinButton mint={mint} symbol={coin.symbol} onChange={onWatchChange} />
           <VenueLinks mint={mint} compact />
           <Link href={`/coins/${mint}`} style={{ color: "var(--acid)", fontSize: 11, letterSpacing: "0.1em" }}>
             FULL DESK →
@@ -437,7 +473,8 @@ function SortHead({
 }
 
 export function Desk() {
-  const [status, setStatus] = useState<"all" | CoinStatus>("all");
+  const [status, setStatus] = useState<DeskTab>("all");
+  const [watch, setWatch] = useState<WatchItem[]>([]);
   const [query, setQuery] = useState("");
   const [q, setQ] = useState("");
   const [page, setPage] = useState(1);
@@ -466,8 +503,11 @@ export function Desk() {
   const noticesRef = useRef(notices);
   noticesRef.current = notices;
   const noticesReadyRef = useRef(false);
-  const filtersRef = useRef({ status, q, page, sort, dir, hasStats: false });
-  filtersRef.current = { status, q, page, sort, dir, hasStats: Boolean(stats) };
+  const watchMints = watch.map((w) => w.mint);
+  const filtersRef = useRef({ status, q, page, sort, dir, hasStats: false, watchMints });
+  filtersRef.current = { status, q, page, sort, dir, hasStats: Boolean(stats), watchMints };
+  const openMintRef = useRef(openMint);
+  openMintRef.current = openMint;
   const bookRef = useRef(new Map<string, CoinStatus>());
   const loadRef = useRef<(opts?: { silent?: boolean }) => Promise<void>>(async () => undefined);
 
@@ -511,6 +551,36 @@ export function Desk() {
     }
   }
 
+  function flashNotices(fresh: EntryNotice[]) {
+    if (!fresh.length) return;
+    setToasts((cur) => [...fresh, ...cur].slice(0, 8));
+    window.setTimeout(() => {
+      setToasts((cur) => cur.filter((t) => !fresh.some((f) => f.mint === t.mint && f.at === t.at)));
+    }, 8000);
+    if (typeof Notification === "undefined" || Notification.permission !== "granted") return;
+    for (const note of fresh) {
+      try {
+        const hrefs = venueLinks(note.mint);
+        const dump = note.kind === "dump";
+        const n = new Notification(`${dump ? "DUMP" : "ENTRY"} ${note.symbol}`, {
+          body: dump
+            ? `${dumpLine(note)}\nRUG ${scorePct(note.rugProb)} · ENTRY ${scorePct(note.entryProb)}\n${note.mint.slice(0, 4)}…${note.mint.slice(-4)}`
+            : `RUG ${scorePct(note.rugProb)} · ENTRY ${scorePct(note.entryProb)} · EXIT ${scorePct(note.exitProb)}\nPUMP · GMGN · AXIOM\n${note.mint.slice(0, 4)}…${note.mint.slice(-4)}`,
+          tag: dump ? `dump-${note.mint}` : note.mint,
+        });
+        n.onclick = () => {
+          window.focus();
+          window.open(hrefs.pumpfun, "_blank", "noopener,noreferrer");
+          window.open(hrefs.gmgn, "_blank", "noopener,noreferrer");
+          window.open(hrefs.axiom, "_blank", "noopener,noreferrer");
+          selectMint(note.mint, note.kind);
+        };
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+
   function announce(rowsIn: CoinDoc[]) {
     if (!noticesReadyRef.current) return;
     const { next, fresh } = pushEntries(
@@ -519,37 +589,31 @@ export function Desk() {
     );
     noticesRef.current = next;
     setNotices(next);
-    if (!fresh.length) return;
-    setToasts((cur) => [...fresh, ...cur].slice(0, 6));
-    window.setTimeout(() => {
-      setToasts((cur) => cur.filter((t) => !fresh.some((f) => f.mint === t.mint && f.at === t.at)));
-    }, 8000);
-    if (typeof Notification === "undefined" || Notification.permission !== "granted") return;
-    for (const note of fresh) {
-      try {
-        const hrefs = venueLinks(note.mint);
-        const n = new Notification(`ENTRY ${note.symbol}`, {
-          body: `RUG ${scorePct(note.rugProb)} · ENTRY ${scorePct(note.entryProb)} · EXIT ${scorePct(note.exitProb)}\nPUMP · GMGN · AXIOM\n${note.mint.slice(0, 4)}…${note.mint.slice(-4)}`,
-          tag: note.mint,
-        });
-        n.onclick = () => {
-          window.focus();
-          window.open(hrefs.pumpfun, "_blank", "noopener,noreferrer");
-          window.open(hrefs.gmgn, "_blank", "noopener,noreferrer");
-          window.open(hrefs.axiom, "_blank", "noopener,noreferrer");
-          selectMint(note.mint);
-        };
-      } catch {
-        /* ignore */
-      }
-    }
+    flashNotices(fresh);
   }
 
-  function selectMint(mint: string) {
+  function announceDump(rowsIn: CoinDoc[]) {
+    if (!noticesReadyRef.current) return;
+    const { next, fresh } = pushDumps(noticesRef.current, rowsIn);
+    noticesRef.current = next;
+    setNotices(next);
+    flashNotices(fresh);
+  }
+
+  function noteDumps(incoming: CoinDoc[]) {
+    const fresh: CoinDoc[] = [];
+    for (const row of incoming) {
+      const prev = bookRef.current.get(row.mint);
+      if ((prev === "enter" || prev === "watching") && isDumpedCoin(row)) fresh.push(row);
+    }
+    if (fresh.length) announceDump(fresh);
+  }
+
+  function selectMint(mint: string, kind?: NoticeKind) {
     markRead(mint);
     setBellOpen(false);
     setToasts((cur) => cur.filter((t) => t.mint !== mint));
-    setStatus("enter");
+    setStatus(kind === "dump" ? "exit" : "enter");
     setQuery(mint);
     setQ(mint);
     setPage(1);
@@ -578,12 +642,18 @@ export function Desk() {
       setStats((cur) => bumpDeskStats(cur, prev.status, next.status) || cur);
       bookRef.current.set(next.mint, next.status);
     }
-    if (hasFlag(next, "enter")) announce([next]);
-    setRows((rs) =>
-      status === "all" || hasFlag(next, status)
-        ? rs.map((r) => (r.mint === next.mint ? { ...r, ...next } : r))
-        : rs.filter((r) => r.mint !== next.mint),
-    );
+    const prevStatus = prev?.status || bookRef.current.get(next.mint);
+    if (isLiveEnter(next)) announce([next]);
+    if ((prevStatus === "enter" || prevStatus === "watching") && isDumpedCoin(next)) announceDump([next]);
+    setRows((rs) => {
+      const open = openMintRef.current === next.mint;
+      const stays = status === "all" || status === "watchlist" || hasFlag(next, status) || open;
+      if (!stays) return rs.filter((r) => r.mint !== next.mint);
+      if (rs.some((r) => r.mint === next.mint)) {
+        return rs.map((r) => (r.mint === next.mint ? { ...r, ...next } : r));
+      }
+      return open ? [next, ...rs] : rs;
+    });
   }
 
   async function rescore(mint: string) {
@@ -616,30 +686,57 @@ export function Desk() {
     const f = filtersRef.current;
     try {
       const qs = new URLSearchParams({
-        status: f.status,
+        status: f.status === "watchlist" ? "all" : f.status,
         source: "live",
         q: f.q,
         page: String(f.page),
         limit: String(PAGE_SIZE),
         sort: f.sort,
         dir: f.dir,
+        ...(silent ? { lite: "1" } : {}),
       });
+      if (f.status === "watchlist") {
+        if (!f.watchMints.length) {
+          if (gen !== uiGen.current) return;
+          setRows([]);
+          setPages(1);
+          setTotal(0);
+          setError("");
+          return;
+        }
+        qs.set("mints", f.watchMints.join(","));
+      }
       const coinP = fetch(`/api/coins?${qs}`, { signal, cache: "no-store" }).then((r) => r.json());
       const enterP =
-        f.status === "enter"
+        silent || f.status === "enter"
           ? coinP
           : fetch("/api/coins?status=enter&source=live&sort=updatedAt&dir=desc&limit=20&page=1&lite=1", {
               signal,
               cache: "no-store",
             }).then((r) => r.json());
+      const exitP =
+        silent
+          ? Promise.resolve({ coins: [] })
+          : f.status === "exit"
+            ? coinP
+            : fetch("/api/coins?status=exit&source=live&sort=updatedAt&dir=desc&limit=20&page=1&lite=1", {
+                signal,
+                cache: "no-store",
+              }).then((r) => r.json());
       const jobP = silent && f.hasStats
         ? Promise.resolve(null)
         : fetch("/api/ingest", { signal, cache: "no-store" }).then((r) => r.json());
-      const [c, enters, ingest] = await Promise.all([coinP, enterP, jobP]);
+      const [c, enters, exits, ingest] = await Promise.all([coinP, enterP, exitP, jobP]);
       if (gen !== uiGen.current) return;
       const nextRows: CoinDoc[] = c.coins || [];
+      const enterRows: CoinDoc[] = enters.coins || [];
+      const exitRows: CoinDoc[] = exits.coins || [];
+      noteDumps(nextRows);
+      noteDumps(enterRows);
+      noteDumps(exitRows);
       bookStats(nextRows);
-      bookStats(enters.coins || []);
+      bookStats(enterRows);
+      bookStats(exitRows);
       const s = c.stats;
       if (s && typeof s.total === "number") {
         setStats({
@@ -654,9 +751,12 @@ export function Desk() {
           asOf: s.asOf || new Date().toISOString(),
         });
       }
-      setRows(nextRows);
-      setPages(c.pages || 1);
-      setTotal(c.total || 0);
+      const nextPages = Math.max(1, Number(c.pages) || 1);
+      const nextTotal = Math.max(0, Number(c.total) || 0);
+      setRows((prev) => keepOpenRow(nextRows, prev, openMintRef.current));
+      setPages(nextPages);
+      setTotal(nextTotal);
+      if (f.page > nextPages) setPage(nextPages);
       if (ingest) setJob(ingest.job || null);
       announce(enters.coins || nextRows.filter((r) => hasFlag(r, "enter")));
       setError("");
@@ -699,6 +799,9 @@ export function Desk() {
     noticesRef.current = store;
     setNotices(store);
     noticesReadyRef.current = true;
+    const pins = loadWatchlist();
+    setWatch(pins);
+    syncWatchPins(pins);
   }, []);
 
   useEffect(() => {
@@ -831,12 +934,17 @@ export function Desk() {
                   ? `hourly ${new Date(job.lastRunAt).toLocaleTimeString()} · +${job.inserted ?? 0} · ${job.scored ?? 0} scored`
                   : "ingest has not run yet"}
               </p>
-              <Link
-                href="/trades"
-                style={{ display: "inline-block", marginTop: 10, color: "var(--acid)", letterSpacing: "0.14em", fontSize: 12 }}
-              >
-                FILLS →
-              </Link>
+              <div style={{ display: "flex", gap: 16, justifyContent: "flex-end", marginTop: 10 }}>
+                <Link href="/watch" style={{ color: "var(--acid)", letterSpacing: "0.14em", fontSize: 12 }}>
+                  WATCH LIST →
+                </Link>
+                <Link href="/trades" style={{ color: "var(--acid)", letterSpacing: "0.14em", fontSize: 12 }}>
+                  FILLS →
+                </Link>
+                <Link href="/keys" style={{ color: "var(--acid)", letterSpacing: "0.14em", fontSize: 12 }}>
+                  KEYS →
+                </Link>
+              </div>
             </div>
             <EntryBell
               items={notices.items}
@@ -900,7 +1008,9 @@ export function Desk() {
                       ? stats?.exit
                       : f.id === "migrated"
                         ? stats?.migrated
-                        : undefined;
+                        : f.id === "watchlist"
+                          ? watch.length
+                          : undefined;
           return (
             <button
               key={f.id}
@@ -991,7 +1101,9 @@ export function Desk() {
         {emptyLoading && <TapeSkeleton rows={8} />}
         {!emptyLoading && rows.length === 0 && (
           <p style={{ padding: 24, color: "var(--mute)" }}>
-            No live prints on this page. Hit PULL NOW to fetch new launches.
+            {status === "watchlist"
+              ? "Watch list is empty. Hit PIN on any coin record."
+              : "No live prints on this page. Hit PULL NOW to fetch new launches."}
           </p>
         )}
         <div style={{ opacity: dimRows ? 0.35 : 1, transition: "opacity 0.15s linear" }}>
@@ -1031,7 +1143,7 @@ export function Desk() {
                       {rowFlags(row).map((f, i) => (
                         <span key={f}>
                           {i > 0 ? <span style={{ color: "var(--mute)" }}> · </span> : null}
-                          <span style={{ color: tone(f) }}>{f.toUpperCase()}</span>
+                          <span style={{ color: tone(f) }}>{f === "dump1st" ? "DUMP1st" : f === "hit15x" ? "HIT15x" : f === "hold70" ? "HOLD70" : f.toUpperCase()}</span>
                         </span>
                       ))}
                     </span>
@@ -1066,6 +1178,25 @@ export function Desk() {
                       onClick={(e) => e.stopPropagation()}
                       style={{ display: "inline-flex", gap: 6, flexWrap: "wrap", alignItems: "center" }}
                     >
+                      <PinButton
+                        mint={row.mint}
+                        symbol={row.symbol}
+                        onChange={(items) => {
+                          setWatch(items);
+                          if (status === "watchlist" && !items.some((w) => w.mint === row.mint)) {
+                            setRows((rs) => rs.filter((r) => r.mint !== row.mint));
+                            setTotal((n) => Math.max(0, n - 1));
+                          }
+                        }}
+                      />
+                      <BanButton
+                        mint={row.mint}
+                        symbol={row.symbol}
+                        onBanned={(mint) => {
+                          setRows((rs) => rs.filter((r) => r.mint !== mint));
+                          setTotal((n) => Math.max(0, n - 1));
+                        }}
+                      />
                       <button
                         type="button"
                         disabled={scoringMint === row.mint}
@@ -1085,7 +1216,19 @@ export function Desk() {
                       <VenueLinks mint={row.mint} compact />
                     </span>
                   </div>
-                  {open && <TokenAccordion mint={row.mint} onScored={applyScored} />}
+                  {open && (
+                    <TokenAccordion
+                      mint={row.mint}
+                      onScored={applyScored}
+                      onWatchChange={(items) => {
+                        setWatch(items);
+                        if (status === "watchlist" && !items.some((w) => w.mint === row.mint)) {
+                          setRows((rs) => rs.filter((r) => r.mint !== row.mint));
+                          setTotal((n) => Math.max(0, n - 1));
+                        }
+                      }}
+                    />
+                  )}
                 </div>
               );
             })}
@@ -1154,23 +1297,23 @@ export function Desk() {
         >
           {toasts.map((n) => (
             <div
-              key={`${n.mint}-${n.at}`}
+              key={`${n.kind || "enter"}-${n.mint}-${n.at}`}
               style={{
                 textAlign: "left",
-                border: "1px solid var(--acid)",
+                border: n.kind === "dump" ? "1px solid var(--rust)" : "1px solid var(--acid)",
                 background: "#16140f",
-                color: "var(--acid)",
+                color: n.kind === "dump" ? "var(--rust)" : "var(--acid)",
                 padding: "12px 14px",
                 boxShadow: "0 12px 28px rgba(0,0,0,0.4)",
               }}
             >
               <button
                 type="button"
-                onClick={() => selectMint(n.mint)}
+                onClick={() => selectMint(n.mint, n.kind)}
                 style={{ all: "unset", cursor: "pointer", display: "block", width: "100%" }}
               >
                 <span style={{ display: "block", fontSize: 11, letterSpacing: "0.12em", color: "var(--mute)" }}>
-                  ENTRY
+                  {n.kind === "dump" ? "DUMP" : "ENTRY"}
                 </span>
                 <span style={{ display: "block", marginTop: 4, fontSize: 15 }}>{n.symbol}</span>
                 <span
@@ -1186,6 +1329,7 @@ export function Desk() {
                   <span style={{ color: "var(--rust)" }}>RUG {scorePct(n.rugProb)}</span>
                   <span style={{ color: "var(--acid)" }}>ENTRY {scorePct(n.entryProb)}</span>
                   <span style={{ color: "var(--amber)" }}>EXIT {scorePct(n.exitProb)}</span>
+                  {n.kind === "dump" && <span style={{ color: "var(--rust)" }}>{dumpLine(n)}</span>}
                 </span>
                 <span style={{ display: "block", marginTop: 3, fontSize: 10, color: "var(--mute)" }}>
                   {n.mint.slice(0, 4)}…{n.mint.slice(-4)}
@@ -1200,12 +1344,12 @@ export function Desk() {
                     window.open(hrefs.pumpfun, "_blank", "noopener,noreferrer");
                     window.open(hrefs.gmgn, "_blank", "noopener,noreferrer");
                     window.open(hrefs.axiom, "_blank", "noopener,noreferrer");
-                    selectMint(n.mint);
+                    selectMint(n.mint, n.kind);
                   }}
                   style={{
                     all: "unset",
                     cursor: "pointer",
-                    color: "var(--acid)",
+                    color: n.kind === "dump" ? "var(--rust)" : "var(--acid)",
                     fontSize: 11,
                     letterSpacing: "0.08em",
                   }}

@@ -1,4 +1,5 @@
 import { randomUUID } from "crypto";
+import { notBlacklistedMongo } from "./blacklist";
 import { peekDeskStats } from "./deskStats";
 import { hasFlag } from "./flags";
 import { coins, positions, traderSettings, trades } from "./mongo";
@@ -44,7 +45,7 @@ export async function paperEnterSweep() {
   const settings = await getTraderSettings();
   if (!settings.enabled) return;
   const rows = await (await coins())
-    .find({ source: "live", $or: [{ status: "enter" }, { flags: "enter" }] })
+    .find({ source: "live", $or: [{ status: "enter" }, { flags: "enter" }], ...(await notBlacklistedMongo()) })
     .sort({ updatedAt: -1 })
     .limit(settings.maxOpen * 2)
     .toArray();

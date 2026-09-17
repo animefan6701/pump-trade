@@ -77,20 +77,8 @@ function asBundleInfo(raw: unknown): BundleInfo | null {
   return row as BundleInfo;
 }
 
-async function feePayers(sigs: string[]): Promise<string[]> {
-  const key = process.env.HELIUS_API_KEY;
-  if (!key || sigs.length === 0) return [];
-  const r = await fetch(`https://api.helius.xyz/v0/transactions?api-key=${key}`, {
-    method: "POST",
-    headers: { "content-type": "application/json", accept: "application/json" },
-    cache: "no-store",
-    signal: AbortSignal.timeout(10_000),
-    body: JSON.stringify({ transactions: sigs.slice(0, 20) }),
-  });
-  if (!r.ok) return [];
-  const txs = (await r.json()) as Array<{ feePayer?: string }>;
-  if (!Array.isArray(txs)) return [];
-  return txs.map((t) => t.feePayer).filter((w): w is string => Boolean(w));
+async function feePayers(_sigs: string[]): Promise<string[]> {
+  return [];
 }
 
 /** Same-funder, same-slot, same-second, plus official Jito bundle wallet sets. */

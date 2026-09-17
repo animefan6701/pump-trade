@@ -6,11 +6,12 @@ export const maxDuration = 30;
 
 type Ctx = { params: Promise<{ mint: string }> };
 
-export async function GET(_: Request, ctx: Ctx) {
+export async function GET(req: Request, ctx: Ctx) {
   const { mint } = await ctx.params;
   if (!mint) return NextResponse.json({ error: "mint required" }, { status: 400 });
+  const view = new URL(req.url).searchParams.get("view") === "1";
   try {
-    const tape = await loadTokenTape(mint);
+    const tape = await loadTokenTape(mint, { rescore: !view });
     return NextResponse.json(tape);
   } catch (e) {
     return NextResponse.json(

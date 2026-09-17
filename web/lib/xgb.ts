@@ -22,6 +22,10 @@ export type RugModel = {
 };
 
 let cached: RugModel | null | undefined;
+let cachedCal:
+  | { threshold: number; plattA?: number; plattB?: number; n: number; at: number }
+  | null
+  | undefined;
 
 function modelPaths() {
   const fromEnv = process.env.RUG_MODEL_PATH || process.env.RUG_LIVE_MODEL_PATH;
@@ -97,26 +101,55 @@ export function scoreRugModel(features: Record<string, number | null | undefined
   });
   let margin = model.base_score || 0;
   for (const tree of model.trees) margin += walk(tree, x);
+  let rugProb = Math.min(0.999, Math.max(0.001, sigmoid(margin)));
+  const cal = loadCal();
+  if (cal?.plattA != null && cal.plattB != null) rugProb = applyPlatt(rugProb, cal.plattA, cal.plattB);
   return {
-    rugProb: Math.min(0.999, Math.max(0.001, sigmoid(margin))),
+    rugProb,
     used,
     missing,
-    threshold: calThreshold() ?? Math.max(0.45, Number(process.env.RUG_THRESHOLD || 0.55)),
+    threshold: cal?.threshold ?? Math.max(0.45, Number(process.env.RUG_THRESHOLD || 0.55)),
   };
 }
 
-function calThreshold(): number | null {
+function applyPlatt(p: number, a: number, b: number) {
+  const eps = 1e-6;
+  const q = Math.min(1 - eps, Math.max(eps, p));
+  return Math.min(0.999, Math.max(0.001, sigmoid(a * Math.log(q / (1 - q)) + b)));
+}
+
+export function invalidateCalCache() {
+  cachedCal = undefined;
+}
+
+function loadCal() {
+  if (cachedCal !== undefined) return cachedCal;
   const cwd = process.cwd();
   for (const path of [resolve(cwd, "models/rug_cal.json"), resolve(cwd, "../models/rug_cal.json")]) {
     try {
       if (!existsSync(path)) continue;
-      const raw = JSON.parse(readFileSync(path, "utf8")) as { threshold?: number; n?: number };
+      const raw = JSON.parse(readFileSync(path, "utf8")) as {
+        threshold?: number;
+        n?: number;
+        slice?: string;
+        plattA?: number;
+        plattB?: number;
+      };
+      if (raw.slice !== "xgb-live") continue;
       if (typeof raw.threshold === "number" && (raw.n || 0) >= 40) {
-        return Math.max(0.45, Math.min(0.75, raw.threshold));
+        cachedCal = {
+          threshold: Math.max(0.45, Math.min(0.75, raw.threshold)),
+          plattA: typeof raw.plattA === "number" ? raw.plattA : undefined,
+          plattB: typeof raw.plattB === "number" ? raw.plattB : undefined,
+          n: raw.n || 0,
+          at: Date.now(),
+        };
+        return cachedCal;
       }
     } catch {
       /* keep env cutoff */
     }
   }
-  return null;
+  cachedCal = null;
+  return cachedCal;
 }

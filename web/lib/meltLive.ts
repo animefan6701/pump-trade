@@ -1,18 +1,10 @@
 import { config as loadEnv } from "dotenv";
 import { resolve } from "path";
+import { heliusRpc } from "./heliusKeys";
 import type { LaunchSnapshot, MeltLiveFeatures, TapeTrade } from "./types";
 
 loadEnv({ path: resolve(process.cwd(), "../.env") });
 loadEnv({ path: resolve(process.cwd(), ".env") });
-
-function rpcUrl() {
-  return (
-    process.env.SOLANA_RPC_URL ||
-    (process.env.HELIUS_API_KEY
-      ? `https://mainnet.helius-rpc.com/?api-key=${process.env.HELIUS_API_KEY}`
-      : "")
-  );
-}
 
 /** RugCheck `pct` is always 0–100, including values like 0.74 (0.74%, not 74%). */
 function asFrac(p: number) {
@@ -119,47 +111,86 @@ async function rugReport(mint: string): Promise<RugReport | null> {
 }
 
 async function tokenLargest(mint: string): Promise<number[] | null> {
-  const url = rpcUrl();
-  if (!url) return null;
-  const r = await fetch(url, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    cache: "no-store",
-    signal: AbortSignal.timeout(8_000),
-    body: JSON.stringify({
+  const j = (await heliusRpc(
+    {
       jsonrpc: "2.0",
       id: 1,
       method: "getTokenLargestAccounts",
       params: [mint],
-    }),
-  });
-  const j = (await r.json()) as {
-    result?: { value?: Array<{ uiAmount?: number; amount?: string }> };
-  };
+    },
+    1,
+  )) as { result?: { value?: Array<{ uiAmount?: number; amount?: string }> } } | null;
+  if (!j) return null;
   const rows = j.result?.value || [];
   const amounts = rows.map((x) => Number(x.uiAmount || 0)).filter((n) => n > 0);
   return amounts.length ? amounts : null;
 }
 
+const holderCache = new Map<string, { n: number; at: number }>();
+const HOLDER_CACHE_MS = 5 * 60_000;
+
+async function cachedHolderAccounts(mint: string): Promise<number | undefined> {
+  const hit = holderCache.get(mint);
+  if (hit && Date.now() - hit.at < HOLDER_CACHE_MS) return hit.n;
+  const n = await heliusHolderAccounts(mint);
+  if (typeof n === "number") holderCache.set(mint, { n, at: Date.now() });
+  return n;
+}
+
 async function heliusHolderAccounts(mint: string): Promise<number | undefined> {
-  const url = rpcUrl();
-  if (!url) return undefined;
-  const r = await fetch(url, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    cache: "no-store",
-    signal: AbortSignal.timeout(8_000),
-    body: JSON.stringify({
+  const j = (await heliusRpc(
+    {
       jsonrpc: "2.0",
       id: 1,
       method: "getTokenAccounts",
       params: { mint, page: 1, limit: 1, options: { showZeroBalance: false } },
-    }),
-  });
-  const j = (await r.json()) as { result?: { total?: number } };
+    },
+    10,
+  )) as { result?: { total?: number } } | null;
+  if (!j) return undefined;
   const n = j.result?.total;
   return typeof n === "number" && n >= 0 ? n : undefined;
 }
+
+const SNIPER_KEYS = [
+  "group2_sniper_0s_hold_pct",
+  "group2_sniper_1s_hold_pct",
+  "group2_sniper_5s_hold_pct",
+  "group2_sniper_10s_hold_pct",
+  "group2_sniper_0s_ratio",
+  "group2_sniper_1s_ratio",
+  "group2_sniper_5s_ratio",
+  "group2_sniper_10s_ratio",
+  "group2_sniper_0s_num",
+  "group2_sniper_1s_num",
+  "group2_sniper_5s_num",
+  "group2_sniper_10s_num",
+] as const;
+
+export function pickSniperFeatures(
+  m?: MeltLiveFeatures | Record<string, number | string | boolean | null | undefined> | null,
+): MeltLiveFeatures | undefined {
+  if (!m) return undefined;
+  const out: MeltLiveFeatures = {};
+  let n = 0;
+  for (const k of SNIPER_KEYS) {
+    const v = (m as Record<string, unknown>)[k];
+    if (typeof v === "number" && Number.isFinite(v)) {
+      (out as Record<string, number>)[k] = v;
+      n += 1;
+    }
+  }
+  return n > 0 ? out : undefined;
+}
+
+export function hasSniperFeatures(
+  m?: MeltLiveFeatures | Record<string, number | string | boolean | null | undefined> | null,
+) {
+  return Boolean(pickSniperFeatures(m));
+}
+
+const PUMP_SUPPLY = 1_000_000_000;
+const SNIPER_WINDOWS = [0, 1, 5, 10] as const;
 
 export function meltFromTrades(
   trades: TapeTrade[],
@@ -167,8 +198,11 @@ export function meltFromTrades(
   creator?: string,
 ): MeltLiveFeatures {
   if (trades.length === 0) return {};
-  const mintTs = launchedAt ? Date.parse(launchedAt) : Math.min(...trades.map((t) => t.t));
-  const hasLaunchWindow = trades.some((t) => Math.abs(t.t - mintTs) <= 15_000);
+  const launched = launchedAt ? Date.parse(launchedAt) : NaN;
+  const buyTs = trades.filter((t) => t.side === "buy" && t.t > 0).map((t) => t.t);
+  const firstBuy = buyTs.length ? Math.min(...buyTs) : Math.min(...trades.map((t) => t.t));
+  const inLaunch = Number.isFinite(launched) && trades.some((t) => Math.abs(t.t - launched) <= 15_000);
+  const t0 = inLaunch ? launched : firstBuy;
   const wallets = new Set<string>();
   const buyers = new Set<string>();
   const sellers = new Set<string>();
@@ -177,10 +211,15 @@ export function meltFromTrades(
   let sellN = 0;
   let buySol = 0;
   let sellSol = 0;
-  const sniper0 = new Set<string>();
-  const sniper1 = new Set<string>();
-  const sniper5 = new Set<string>();
-  const sniper10 = new Set<string>();
+  const sniperWallets = {
+    0: new Set<string>(),
+    1: new Set<string>(),
+    5: new Set<string>(),
+    10: new Set<string>(),
+  };
+  const sniperTokens = { 0: 0, 1: 0, 5: 0, 10: 0 };
+  const sniperSol = { 0: 0, 1: 0, 5: 0, 10: 0 };
+  let sawTokens = false;
 
   for (const t of trades) {
     if (t.wallet) wallets.add(t.wallet);
@@ -191,12 +230,16 @@ export function meltFromTrades(
       buyN += 1;
       buySol += t.sol;
       buyers.add(t.wallet);
-      if (hasLaunchWindow) {
-        const dt = (t.t - mintTs) / 1000;
-        if (dt <= 0) sniper0.add(t.wallet);
-        if (dt <= 1) sniper1.add(t.wallet);
-        if (dt <= 5) sniper5.add(t.wallet);
-        if (dt <= 10) sniper10.add(t.wallet);
+      if (typeof t.tokens === "number" && t.tokens > 0) sawTokens = true;
+      if (t0 > 0) {
+        const dt = (t.t - t0) / 1000;
+        for (const w of SNIPER_WINDOWS) {
+          if (dt <= w) {
+            if (t.wallet) sniperWallets[w].add(t.wallet);
+            sniperTokens[w] += t.tokens || 0;
+            sniperSol[w] += t.sol || 0;
+          }
+        }
       }
     } else {
       sellN += 1;
@@ -224,14 +267,17 @@ export function meltFromTrades(
     creatorSold: Boolean(creator && trades.some((t) => t.side === "sell" && t.wallet === creator)),
   };
 
-  if (hasLaunchWindow) {
-    out.group2_sniper_0s_num = sniper0.size;
-    out.group2_sniper_5s_num = sniper5.size;
-    out.group2_sniper_10s_num = sniper10.size;
-    out.group2_sniper_0s_ratio = sniper0.size / holders;
-    out.group2_sniper_1s_ratio = sniper1.size / holders;
-    out.group2_sniper_5s_ratio = sniper5.size / holders;
-    out.group2_sniper_10s_ratio = sniper10.size / holders;
+  if (t0 > 0) {
+    for (const w of SNIPER_WINDOWS) {
+      const hold = sawTokens
+        ? sniperTokens[w] / PUMP_SUPPLY
+        : buySol > 0
+          ? sniperSol[w] / buySol
+          : 0;
+      (out as Record<string, number>)[`group2_sniper_${w}s_num`] = sniperWallets[w].size;
+      (out as Record<string, number>)[`group2_sniper_${w}s_ratio`] = sniperWallets[w].size / holders;
+      (out as Record<string, number>)[`group2_sniper_${w}s_hold_pct`] = Math.min(1, Math.max(0, hold));
+    }
   }
 
   return out;
@@ -246,10 +292,15 @@ export async function fetchMeltLive(
   freezeAuthority?: boolean;
   melt: MeltLiveFeatures;
 }> {
-  const [report, accounts] = await Promise.all([
-    rugReport(mint).catch(() => null),
-    heliusHolderAccounts(mint).catch(() => undefined),
-  ]);
+  const report = await rugReport(mint).catch(() => null);
+  const rawReport = report as (RugReport & Record<string, unknown>) | null;
+  const reportedHolders = (
+    [report?.totalHolders, report?.total_holders, report?.holderCount, rawReport?.holders].find(
+      (v) => typeof v === "number" && v > 2,
+    ) as number | undefined
+  );
+  const accounts =
+    reportedHolders == null ? await cachedHolderAccounts(mint).catch(() => undefined) : undefined;
   const needLargest = !report?.topHolders?.length;
   const largest = needLargest ? await tokenLargest(mint).catch(() => null) : null;
 
@@ -263,11 +314,7 @@ export async function fetchMeltLive(
     melt = concentration(report, opts.poolAddress);
     mintAuthority = Boolean(report.token?.mintAuthority);
     freezeAuthority = Boolean(report.token?.freezeAuthority);
-    const raw = report as RugReport & Record<string, unknown>;
-    const reported = [report.totalHolders, report.total_holders, report.holderCount, raw.holders].find(
-      (v) => typeof v === "number" && v > 0,
-    ) as number | undefined;
-    if (reported) holders = holders ? Math.max(holders, reported) : reported;
+    if (reportedHolders) holders = holders ? Math.max(holders, reportedHolders) : reportedHolders;
     if (typeof holders === "number") melt.group3_holder_num = holders;
     if (!melt.group2_dev_hold_pct && opts.creator && report.topHolders) {
       const row = report.topHolders.find(
@@ -277,9 +324,6 @@ export async function fetchMeltLive(
         melt.group2_dev_hold_pct = holderFrac(row);
         melt.devHoldPct = holderFrac(row);
       }
-    }
-    if (typeof report.creatorBalance === "number" && report.creatorBalance === 0 && opts.complete) {
-      melt.creatorSold = true;
     }
     if (typeof report.graphInsidersDetected === "number" && report.graphInsidersDetected > 0) {
       melt.insiderGraph = report.graphInsidersDetected;

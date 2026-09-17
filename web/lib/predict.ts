@@ -1,5 +1,7 @@
+import { athDumpFloor, isOffAth } from "./dumpCheck";
 import { scoreCorpusRug, scoreEntryModel } from "./entryModel";
 import { flagsFor } from "./flags";
+import { trueTop10 } from "./migrateSeries";
 import { scoreRugModel } from "./xgb";
 import type { CoinDoc, LaunchSnapshot, RiskLabel } from "./types";
 
@@ -18,7 +20,7 @@ function envNum(name: string, fallback: number) {
 }
 
 function meltVector(snap: LaunchSnapshot): Record<string, number | null | undefined> {
-  const m = snap.melt || {};
+  const m = { ...(snap.melt || {}), ...(snap.launchSnipers || {}) };
   const tape = snap.tape;
   return {
     group2_top1_pct: m.group2_top1_pct ?? null,
@@ -37,6 +39,7 @@ function meltVector(snap: LaunchSnapshot): Record<string, number | null | undefi
     group2_sniper_5s_ratio: m.group2_sniper_5s_ratio ?? null,
     group2_sniper_10s_ratio: m.group2_sniper_10s_ratio ?? null,
     group2_sniper_0s_num: m.group2_sniper_0s_num ?? null,
+    group2_sniper_1s_num: m.group2_sniper_1s_num ?? null,
     group2_sniper_5s_num: m.group2_sniper_5s_num ?? null,
     group2_sniper_10s_num: m.group2_sniper_10s_num ?? null,
     curveHoldPct: m.curveHoldPct ?? null,
@@ -56,6 +59,7 @@ function meltVector(snap: LaunchSnapshot): Record<string, number | null | undefi
     group4_cluster_num: m.group4_cluster_num ?? null,
     group4_cluster_total_pct: m.group4_cluster_total_pct ?? null,
     group4_cluster_max_pct: m.group4_cluster_max_pct ?? null,
+    group4_jito_hit: m.group4_jito_hit ?? null,
   };
 }
 
@@ -108,11 +112,21 @@ export function scoreLaunch(snap: LaunchSnapshot): Omit<CoinDoc, "createdAt" | "
   const vol5 = snap.volume5m ?? 0;
 
   features.mc = Math.round(mc);
+  features.complete = snap.complete ? 1 : 0;
+  features.liq = Math.round(snap.reserveUsd ?? 0);
+  features.vol5 = Math.round(vol5);
+  if (typeof snap.volume1h === "number") features.vol1h = Math.round(snap.volume1h);
+  if (typeof snap.change5m === "number") features.ch5 = Number(snap.change5m.toFixed(2));
+  if (typeof snap.change1h === "number") features.ch1 = Number(snap.change1h.toFixed(2));
+  features.athRatio = Number(minRatio.toFixed(3));
   if (bonding !== undefined) features.bonding = Number(bonding.toFixed(3));
   if (ageMin !== undefined) features.ageMin = Number(ageMin.toFixed(1));
   if (snap.creatorLaunches) features.creatorLaunches = snap.creatorLaunches;
-  if (typeof snap.holders === "number") features.holders = snap.holders;
+  features.holders = typeof snap.holders === "number" ? snap.holders : 0;
   if (typeof top10 === "number") features.top10 = Number(top10.toFixed(3));
+  else features.top10 = -1;
+  features.buyers5m = snap.buyers5m ?? 0;
+  features.sellers5m = snap.sellers5m ?? 0;
   if (typeof devHold === "number") features.devHold = Number(devHold.toFixed(3));
   if (typeof insider === "number") features.bundle = Number(insider.toFixed(3));
   if (typeof tapeCluster === "number") features.tapeCluster = Number(tapeCluster.toFixed(3));
@@ -132,8 +146,14 @@ export function scoreLaunch(snap: LaunchSnapshot): Omit<CoinDoc, "createdAt" | "
   const minBondSec = envNum("MIN_BONDING_SECONDS", 60);
   const liq = snap.reserveUsd ?? 0;
   const curveSol = typeof snap.realSolReserves === "number" ? snap.realSolReserves / 1e9 : 0;
-  // Fake Dex FDV is not a book. Live = real LP or real SOL still in the curve.
-  const liveBook = liq >= 80 || (!snap.complete && curveSol >= 2);
+  const hiddenLive =
+    snap.complete &&
+    liq < 80 &&
+    ((snap.buys5m ?? 0) + (snap.sells5m ?? 0) >= 6 ||
+      (snap.volume1h ?? 0) >= 200 ||
+      (snap.volume5m ?? 0) >= 20);
+  // Fake Dex FDV is not a book. Live = real LP, hidden non-SOL LP with tape, or SOL still in the curve.
+  const liveBook = liq >= 80 || hiddenLive || (!snap.complete && curveSol >= 2);
   const scoreMc = liveBook ? mc : Math.min(mc, 8_000);
   const ghostHolders = typeof snap.holders === "number" && snap.holders <= 2 && liveBook;
 
@@ -154,7 +174,12 @@ export function scoreLaunch(snap: LaunchSnapshot): Omit<CoinDoc, "createdAt" | "
     hardReject = true;
     reasons.push(`creator still holds ${(devHold * 100).toFixed(0)}%`);
   }
-  if (!ghostHolders && typeof top10 === "number" && top10 >= maxTop10) {
+  const adjTop = trueTop10(top10, typeof tapeCluster === "number" ? tapeCluster : undefined);
+  features.trueTop10 = Number(adjTop.toFixed(3));
+  if (!ghostHolders && adjTop >= maxTop10) {
+    hardReject = true;
+    reasons.push(`bundle-adjusted top-10 ${(adjTop * 100).toFixed(0)}%`);
+  } else if (!ghostHolders && typeof top10 === "number" && top10 >= maxTop10) {
     hardReject = true;
     reasons.push(`top-10 wallets hold ${(top10 * 100).toFixed(0)}%`);
   }
@@ -170,7 +195,7 @@ export function scoreLaunch(snap: LaunchSnapshot): Omit<CoinDoc, "createdAt" | "
   if (
     !ghostHolders &&
     typeof snap.holders === "number" &&
-    snap.holders < minHolders &&
+    snap.holders < (snap.complete ? Math.max(minHolders, 100) : minHolders) &&
     ((ageMin !== undefined && ageMin > 30) || snap.complete)
   ) {
     hardReject = true;
@@ -190,11 +215,12 @@ export function scoreLaunch(snap: LaunchSnapshot): Omit<CoinDoc, "createdAt" | "
       `dust LP $${snap.reserveUsd.toFixed(0)} vs $${Math.round(mc).toLocaleString()} MC — drained or fake book`,
     );
   }
-  if (snap.complete && liq < 80 && curveSol < 1) {
+  if (snap.complete && liq < 80 && curveSol < 1 && !hiddenLive) {
     hardReject = true;
     reasons.push("migrated book with no tradeable LP");
   }
   if (
+    !hiddenLive &&
     liq < 80 &&
     ((snap.volume1h ?? 0) >= 1_000 ||
       ((tape?.washRatio ?? 0) >= 0.7 && (tape?.tradeCount ?? 0) >= 15))
@@ -221,7 +247,11 @@ export function scoreLaunch(snap: LaunchSnapshot): Omit<CoinDoc, "createdAt" | "
     reasons.push("idle tape — 5m volume dead");
   }
   if (snap.melt?.creatorSold || tape?.creatorSold) {
-    if (liveBook && (snap.holders ?? 0) >= 200 && (snap.reserveUsd ?? 0) >= 80) {
+    const holdersN = snap.holders;
+    const holdersKnown = typeof holdersN === "number" && holdersN > 2;
+    const liveLp = liq >= 80;
+    const fatUnknown = !holdersKnown && (mc >= 15_000 || vol5 >= 400);
+    if (liveBook && liveLp && (holdersKnown ? holdersN >= 200 : fatUnknown)) {
       watch.push("creator sold earlier — book still live");
     } else {
       hardReject = true;
@@ -229,6 +259,8 @@ export function scoreLaunch(snap: LaunchSnapshot): Omit<CoinDoc, "createdAt" | "
     }
   }
   const insiderGraph = snap.melt?.insiderGraph;
+  if (snap.melt?.creatorSold || tape?.creatorSold) features.creatorSold = 1;
+  if (typeof insiderGraph === "number") features.insiderGraph = insiderGraph;
   if (typeof insiderGraph === "number" && insiderGraph >= 80) {
     hardReject = true;
     reasons.push(`RugCheck insider graph ${insiderGraph} wallets`);
@@ -251,6 +283,7 @@ export function scoreLaunch(snap: LaunchSnapshot): Omit<CoinDoc, "createdAt" | "
     // XGB was fit on migrated books. Imputing sniper/time medians pins almost every live print ~97%.
     if (model.used < 12 || !hasSniperObservation(melt)) {
       features.model = "xgb-sparse";
+      features.sniperSeen = hasSniperObservation(melt) ? 1 : 0;
       const active = vol5 >= 800 && (snap.buyers5m ?? 0) >= 12 && (bonding ?? 0) > 0.1;
       rug = 0.58;
       if (typeof top10 === "number") rug = clamp(0.52 + top10 * 0.4);
@@ -270,9 +303,9 @@ export function scoreLaunch(snap: LaunchSnapshot): Omit<CoinDoc, "createdAt" | "
         rug = clamp(0.35 * rug + 0.65 * corpus.p);
         reasons.push(`corpus dump P(dead)=${(corpus.p * 100).toFixed(0)}%`);
       } else if (snap.complete && liveBook && ((snap.holders ?? 0) >= 200 || vol5 >= 400)) {
-        rug = clamp(0.38 + (top10 ?? 0.12) * 0.35);
+        rug = clamp(Math.max(0.55, 0.48 + (top10 ?? 0.12) * 0.35));
         if (typeof devHold === "number") rug = clamp(rug + Math.max(0, devHold) * 0.2);
-        reasons.push("migrated live book — concentration only, not curve-death corpus");
+        reasons.push("migrated live book — MELT dump prior, not a low-rug entry");
       } else if (snap.complete) {
         rug = Math.max(rug, 0.62);
         reasons.push("sparse migrated book — curve-death corpus does not apply");
@@ -284,6 +317,7 @@ export function scoreLaunch(snap: LaunchSnapshot): Omit<CoinDoc, "createdAt" | "
       }
     } else {
       features.model = "xgb-live";
+      features.sniperSeen = 1;
       rug = model.rugProb;
       reasons.push(
         `MELT live XGB P(dump)=${(model.rugProb * 100).toFixed(0)}% (${model.used} feats)`,
@@ -298,7 +332,26 @@ export function scoreLaunch(snap: LaunchSnapshot): Omit<CoinDoc, "createdAt" | "
     features.model = "hard";
   }
 
-  // Watch flags only — do not move rug.
+  const g4 = melt.group4_cluster_total_pct;
+  const g4max = melt.group4_cluster_max_pct;
+  const g4n = melt.group4_cluster_num;
+  const jitoHit = melt.group4_jito_hit;
+  features.group4 = typeof g4 === "number" ? Number(g4.toFixed(3)) : 0;
+  features.group4n = typeof g4n === "number" ? g4n : 0;
+  features.jito = typeof jitoHit === "number" ? jitoHit : 0;
+  if (!features.creatorSold) features.creatorSold = 0;
+  if (typeof g4 === "number" && g4 >= 0.25) {
+    watch.push(`tape cluster ${(g4 * 100).toFixed(0)}%`);
+    rug = clamp(rug + 0.08);
+  } else if (typeof jitoHit === "number" && jitoHit >= 1) {
+    watch.push(`jito bundles ×${jitoHit}`);
+    rug = clamp(rug + 0.06);
+  } else if (typeof g4n === "number" && g4n >= 2 && (g4max ?? 0) >= 0.15) {
+    watch.push(`jito/cluster ×${g4n}`);
+    rug = clamp(rug + 0.06);
+  }
+
+  // Watch flags only — do not move rug except serial creator / group4 above.
   if (snap.livestream) watch.push("livestream");
   if (snap.boostMode && snap.boostMode !== "NONE") watch.push(`boost ${snap.boostMode}`);
   if (snap.nsfw) watch.push("NSFW");
@@ -312,6 +365,11 @@ export function scoreLaunch(snap: LaunchSnapshot): Omit<CoinDoc, "createdAt" | "
   for (const w of watch) reasons.push(`watch: ${w}`);
 
   // Entry = graduation hazard. Trained on failed-curve + graduate labels, never MELT.
+  // After PumpSwap, hold the last on-curve P(graduate) until a continuation model exists.
+  const heldEntry =
+    typeof snap.lockedEntryProb === "number" && Number.isFinite(snap.lockedEntryProb)
+      ? Math.max(0, Math.min(1, snap.lockedEntryProb))
+      : undefined;
   const entryModel = scoreEntryModel({
     bonding: bonding ?? null,
     ageMin: ageMin ?? null,
@@ -323,7 +381,16 @@ export function scoreLaunch(snap: LaunchSnapshot): Omit<CoinDoc, "createdAt" | "
     sellPressure: melt.group3_sell_pressure ?? null,
   });
   let entry = 0.12;
-  if (entryModel && entryModel.used >= 3) {
+  if (heldEntry != null) {
+    entry = heldEntry;
+    features.entryModel = "held-curve";
+    reasons.push(`held EntryTimer P(graduate)=${(entry * 100).toFixed(0)}% until continuation model`);
+  } else if (snap.complete && entryModel && entryModel.used >= 3) {
+    features.entryModel = "lr-curve";
+    reasons.push(
+      `EntryTimer P(graduate)=${(entryModel.p * 100).toFixed(0)}% — ignored after migrate`,
+    );
+  } else if (entryModel && entryModel.used >= 3) {
     entry = entryModel.p;
     features.entryModel = "lr-curve";
     reasons.push(`EntryTimer P(graduate)=${(entry * 100).toFixed(0)}%`);
@@ -338,13 +405,16 @@ export function scoreLaunch(snap: LaunchSnapshot): Omit<CoinDoc, "createdAt" | "
       reasons.push("curve filling (SOL-in velocity)");
     }
   }
-  if ((snap.change5m ?? 0) >= 25 && (snap.buyers5m ?? 0) >= 20 && (snap.sellers5m ?? 0) < (snap.buyers5m ?? 0)) {
-    entry += 0.08;
-    reasons.push("hot 5m bid, buyers > sellers");
-  }
-  if (bonding !== undefined && bonding < 0.02 && mc < 4000) {
-    entry = Math.min(entry, 0.08);
-    reasons.push("empty curve — almost no SOL in");
+  if (heldEntry == null) {
+    if ((snap.change5m ?? 0) >= 25 && (snap.buyers5m ?? 0) >= 20 && (snap.sellers5m ?? 0) < (snap.buyers5m ?? 0)) {
+      entry += 0.08;
+      reasons.push("hot 5m bid, buyers > sellers");
+    }
+    if (bonding !== undefined && bonding < 0.02 && mc < 4000) {
+      entry = Math.min(entry, 0.08);
+      reasons.push("empty curve — almost no SOL in");
+    }
+    if (snap.complete) entry = Math.min(entry, 0.28);
   }
   // Exit = dump / migrate / mechanical. 5m −40% is exit, not rug.
   let exit = 0.2;
@@ -352,7 +422,14 @@ export function scoreLaunch(snap: LaunchSnapshot): Omit<CoinDoc, "createdAt" | "
     exit += 0.42;
     reasons.push("already graduated — 73% of MELT migrants dump >60% in 20m");
   }
-  if (minRatio < 0.45 && ath > mc) {
+  const offAth = isOffAth({
+    minRatio,
+    athMarketCap: ath,
+    marketCapUsd: mc,
+    liquidityUsd: snap.reserveUsd,
+    holders: snap.holders,
+  });
+  if (offAth) {
     exit += 0.22;
     reasons.push(`off ATH — ${(minRatio * 100).toFixed(0)}% of peak`);
   }
@@ -364,6 +441,10 @@ export function scoreLaunch(snap: LaunchSnapshot): Omit<CoinDoc, "createdAt" | "
     exit += 0.14;
     reasons.push(`1h dump ${snap.change1h!.toFixed(0)}%`);
   }
+  if ((snap.change6h ?? 0) <= -50) {
+    exit += 0.18;
+    reasons.push(`6h dump ${snap.change6h!.toFixed(0)}%`);
+  }
   const buyers = snap.buyers5m ?? 0;
   const sellers = snap.sellers5m ?? 0;
   if (buyers + sellers > 0) {
@@ -374,35 +455,65 @@ export function scoreLaunch(snap: LaunchSnapshot): Omit<CoinDoc, "createdAt" | "
     exit += 0.12;
     reasons.push("5m sellers dominate unique buyers");
   }
-  if ((tape?.dumpRatio ?? 0) >= 0.45) {
+  const chartDump = tape?.dumpRatio ?? 0;
+  const athDump = ath > mc && ath > 0 ? 1 - mc / ath : 0;
+  const dumpFloor = 1 - athDumpFloor({
+    liquidityUsd: snap.reserveUsd,
+    holders: snap.holders,
+    marketCapUsd: mc,
+  });
+  // Same peak as stored ATH — do not add a second dump on the same retrace.
+  if (chartDump >= dumpFloor && chartDump > athDump + 0.08) {
     exit += 0.14;
-    reasons.push(`chart dump ${(tape!.dumpRatio! * 100).toFixed(0)}% off local high`);
+    reasons.push(`chart dump ${(chartDump * 100).toFixed(0)}% off local high`);
   }
   if ((tape?.sellSol ?? 0) > (tape?.buySol ?? 0) * 1.25 && (tape?.sellCount ?? 0) >= 4) {
     exit += 0.1;
     reasons.push("tape SOL out > SOL in");
   }
+  if ((snap.manipScore ?? 0) >= 0.7) {
+    reasons.push(`manipulator flag — held-up cycles ${(snap.manipScore! * 100).toFixed(0)}%`);
+  }
   if (tape) {
     features.trades = tape.tradeCount ?? 0;
     features.unique = tape.uniqueTraders ?? 0;
   }
+  if (bonding !== undefined) features.bonding = Number(bonding.toFixed(3));
+  if (ageMin !== undefined) features.ageMin = Number(ageMin.toFixed(1));
+  const wash = melt.group3_wash_ratio ?? tape?.washRatio;
+  features.wash = typeof wash === "number" ? Number(wash.toFixed(3)) : 0;
+  features.sellPressure =
+    typeof melt.group3_sell_pressure === "number" ? Number(melt.group3_sell_pressure.toFixed(3)) : 0;
 
   const rugCut = model?.threshold ?? envNum("RUG_THRESHOLD", 0.55);
   rug = clamp(rug);
-  entry = clamp(entry, 0.04, 0.88);
+  entry = heldEntry != null ? clamp(heldEntry, 0, 1) : clamp(entry, 0.04, 0.88);
   exit = clamp(exit, 0.06, 0.94);
-  if (rug >= rugCut) entry = Math.min(entry, 0.08);
-  const dumped = (minRatio < 0.45 && ath > mc) || (snap.change5m ?? 0) <= -35 || (snap.change1h ?? 0) <= -50;
-  if (dumped || exit >= 0.75) entry = Math.min(entry, 0.12);
+  const dumped =
+    offAth ||
+    (snap.change5m ?? 0) <= -35 ||
+    (snap.change1h ?? 0) <= -50 ||
+    (snap.change6h ?? 0) <= -50;
+  if (heldEntry == null) {
+    if (rug >= rugCut) entry = Math.min(entry, 0.08);
+    if (dumped || exit >= 0.75) entry = Math.min(entry, 0.12);
+  }
 
   let riskLabel: RiskLabel = "medium";
   if (rug >= 0.6) riskLabel = "high";
   else if (rug < 0.4) riskLabel = "low";
 
   let status: CoinDoc["status"] = "watching";
-  if (hardReject || rug >= rugCut) status = "rejected";
+  const liveXgb = features.model === "xgb-live";
+  if (hardReject) status = "rejected";
+  else if (liveXgb && rug >= rugCut) status = "rejected";
+  else if (!snap.complete && !liveXgb && rug >= rugCut) status = "rejected";
   else if (exit >= 0.75 || dumped) status = "exit";
-  else if (entry >= 0.35 && rug < rugCut - 0.08) status = "enter";
+  else if (!snap.complete && liveXgb && entry >= 0.35 && rug < rugCut - 0.08) {
+    status = "enter";
+  } else if (!snap.complete && entry >= 0.35 && rug < rugCut - 0.08) {
+    reasons.push("on-curve bid — waiting for xgb-live snipers, not ENTER");
+  }
   const flags = flagsFor(status, snap.complete);
 
   return {
@@ -420,7 +531,9 @@ export function scoreLaunch(snap: LaunchSnapshot): Omit<CoinDoc, "createdAt" | "
     exitProb: exit,
     minRatio,
     returnRatio,
-    manipulated: (melt.group3_wash_ratio ?? tape?.washRatio ?? 0) >= 0.65 ? "yes" : "unknown",
+    manipulated:
+      typeof snap.manipScore === "number" && snap.manipScore >= 0.7 ? "yes" : "unknown",
+    manipScore: typeof snap.manipScore === "number" ? snap.manipScore : undefined,
     reasons,
     source: "live",
     complete: snap.complete,
@@ -431,6 +544,8 @@ export function scoreLaunch(snap: LaunchSnapshot): Omit<CoinDoc, "createdAt" | "
     volume5m: snap.volume5m,
     volume1h: snap.volume1h,
     change5m: snap.change5m,
+    change1h: snap.change1h,
+    change6h: snap.change6h,
     holders: snap.holders,
     bondingProgress: bonding,
     launchedAt: snap.launchedAt,

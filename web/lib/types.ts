@@ -27,6 +27,8 @@ export type CoinDoc = {
   volume5m?: number;
   volume1h?: number;
   change5m?: number;
+  change1h?: number;
+  change6h?: number;
   holders?: number;
   bondingProgress?: number;
   launchedAt?: string;
@@ -35,6 +37,31 @@ export type CoinDoc = {
   dex?: string;
   poolAddress?: string;
   features?: Record<string, number | string | boolean>;
+  launchSnipers?: MeltLiveFeatures;
+  launchSigs?: string[];
+  launchTapeAt?: string;
+  tapeTries?: number;
+  nextTapeAt?: string;
+  quoteMisses?: number;
+  migrateAt?: string;
+  migrateMc?: number;
+  migrateEntryProb?: number;
+  migrateFeatures?: Record<string, number | string | boolean>;
+  migrateMinMc?: number;
+  migrateOutcomeAt?: string;
+  migrateMinRatio?: number;
+  migrateHigh?: boolean;
+  migrateSurvive70?: boolean;
+  migrateHit15x?: boolean;
+  migrateMaxMc?: number;
+  migrateHit2x?: boolean;
+  migrateHit5x?: boolean;
+  dir5mProb?: number;
+  hit2xProb?: number;
+  dumpFirstProb?: number;
+  survive70Prob?: number;
+  hit15xProb?: number;
+  manipScore?: number;
   bondingAt?: string;
   prevBonding?: number;
   bondingVelocity?: number;
@@ -105,7 +132,19 @@ export type TraderHistory = {
   };
 };
 
-export type JobId = "ingest" | "live" | "calibrate" | "outcomes" | "rescore";
+export type BlacklistDoc = {
+  mint: string;
+  symbol?: string;
+  addedAt: string;
+};
+
+export type WatchPinDoc = {
+  mint: string;
+  symbol?: string;
+  addedAt: string;
+};
+
+export type JobId = "ingest" | "live" | "newest" | "moon" | "calibrate" | "outcomes" | "rescore" | "rescoreFull";
 
 export type IngestJobDoc = {
   _id: JobId;
@@ -140,6 +179,7 @@ export type TapeTrade = {
   t: number;
   side: "buy" | "sell";
   sol: number;
+  tokens?: number;
   usd?: number;
   wallet: string;
   sig?: string;
@@ -178,6 +218,7 @@ export type MeltLiveFeatures = {
   group2_sniper_5s_ratio?: number | null;
   group2_sniper_10s_ratio?: number | null;
   group2_sniper_0s_num?: number | null;
+  group2_sniper_1s_num?: number | null;
   group2_sniper_5s_num?: number | null;
   group2_sniper_10s_num?: number | null;
   group3_holder_num?: number | null;
@@ -200,6 +241,7 @@ export type MeltLiveFeatures = {
   group4_cluster_num?: number | null;
   group4_cluster_total_pct?: number | null;
   group4_cluster_max_pct?: number | null;
+  group4_jito_hit?: number | null;
   bundleHoldPct?: number | null;
 };
 
@@ -212,17 +254,54 @@ export type ScoreDoc = {
   exitProb: number;
   status: CoinStatus;
   flags?: CoinStatus[];
+  complete?: boolean;
   riskLabel: RiskLabel;
   minRatio: number;
   returnRatio: number;
   features?: Record<string, number | string | boolean>;
   reasons: string[];
   marketCapUsd?: number;
+  athMarketCap?: number;
+  liquidityUsd?: number;
+  volume5m?: number;
+  volume1h?: number;
+  holders?: number;
+  change5m?: number;
+  change1h?: number;
+  launchedAt?: string;
   outcomeAt?: string;
   outcomeMc?: number;
   outcomeMinRatio?: number;
   outcomeReturn?: number;
   outcomeHigh?: boolean;
+  outcomeSurvive70?: boolean;
+  outcomeHit15x?: boolean;
+  outcomeKind?: string;
+  calAttempts?: number;
+  migrateMc?: number;
+  migrateMinMc?: number;
+  migrateMinRatio?: number;
+  migrateHigh?: boolean;
+  migrateKind?: string;
+};
+
+export type MigrateBar = {
+  t: number;
+  mc: number;
+  vol?: number;
+  buy?: number;
+  sell?: number;
+  tx?: number;
+};
+
+export type MigrateSeriesDoc = {
+  mint: string;
+  migrateAt: string;
+  migrateMc: number;
+  bars: MigrateBar[];
+  minMc?: number;
+  maxMc?: number;
+  updatedAt: string;
 };
 
 export type CurveOutcomeDoc = {
@@ -266,6 +345,7 @@ export type LaunchSnapshot = {
   sells5m?: number;
   change5m?: number;
   change1h?: number;
+  change6h?: number;
   reserveUsd?: number;
   volume5m?: number;
   volume1h?: number;
@@ -286,4 +366,44 @@ export type LaunchSnapshot = {
   bundleHoldPct?: number;
   curveHoldPct?: number;
   bondingVelocity?: number;
+  launchSnipers?: MeltLiveFeatures;
+  launchSigs?: string[];
+  launchTapeAt?: string;
+  tapeTries?: number;
+  nextTapeAt?: string;
+  quoteMisses?: number;
+  manipScore?: number;
+  lockedEntryProb?: number;
 };
+
+export type ApiKeyKind = "helius";
+export type ApiKeySource = "user" | "env";
+
+export type ApiKeyDoc = {
+  id: string;
+  kind: ApiKeyKind;
+  source: ApiKeySource;
+  label: string;
+  key: string;
+  projectId?: string;
+  enabled: boolean;
+  priority: number;
+  creditsUsed?: number;
+  creditsRemaining?: number;
+  creditsLimit?: number;
+  prepaidRemaining?: number;
+  usagePct?: number;
+  plan?: string;
+  cycleEnd?: string;
+  localCredits?: number;
+  calls?: number;
+  lastStatus?: number;
+  lastError?: string;
+  lastUsedAt?: string;
+  usageAt?: string;
+  exhaustedUntil?: string;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type PublicApiKey = Omit<ApiKeyDoc, "key"> & { last4: string; active?: boolean };
