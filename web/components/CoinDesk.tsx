@@ -148,6 +148,17 @@ export function CoinDesk({ mint }: { mint: string }) {
       <div style={{ marginTop: 14, display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
         <PinButton mint={coin.mint} symbol={coin.symbol} />
         <BanButton mint={coin.mint} symbol={coin.symbol} onBanned={() => router.push("/")} />
+        <Link href="/analyze" style={{ color: "var(--acid)", letterSpacing: "0.1em", fontSize: 11 }}>
+          ANALYZE →
+        </Link>
+        <Link href="/wallets" style={{ color: "var(--acid)", letterSpacing: "0.1em", fontSize: 11 }}>
+          WALLETS →
+        </Link>
+        {(coin.athMarketCap || coin.marketCapUsd || 0) >= 500_000 ? (
+          <Link href={`/analyze/${coin.mint}`} style={{ color: "var(--acid)", letterSpacing: "0.1em", fontSize: 11 }}>
+            500k TAPE →
+          </Link>
+        ) : null}
         <Link href="/watch" style={{ color: "var(--acid)", letterSpacing: "0.1em", fontSize: 11 }}>
           WATCH LIST →
         </Link>
@@ -187,7 +198,7 @@ export function CoinDesk({ mint }: { mint: string }) {
       </div>
       <p style={{ color: "var(--mute)", fontSize: 12, maxWidth: 640, lineHeight: 1.5 }}>
         {coin.source === "live"
-          ? "Scored from the hourly Pump.fun / GeckoTerminal snapshot. Rule layer only — MELT XGB is not serving yet."
+          ? "Scored from a live Pump.fun / Dex fetch at print time. Held launch heads stay locked; MC / LP / EXIT use the live book."
           : "MELT archive print (Dec 2024–Mar 2025). The coin page may still open after graduation; many are already dead."}
       </p>
       <section

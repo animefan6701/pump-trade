@@ -3,6 +3,8 @@ import { intervalMs, runIngestCycle } from "./ingest";
 import { startLiveIngest } from "./liveIngest";
 import { runOutcomesCycle } from "./outcomes";
 import { fullRescoreIntervalMs, rescoreIntervalMs, rescoreRejected } from "./rescoreRejected";
+import { startPortfolioMilestones } from "./portfolioMilestones";
+import { startWalletTelegram } from "./walletTelegram";
 
 const g = globalThis as typeof globalThis & {
   __tapeIngest?: ReturnType<typeof setInterval>;
@@ -28,6 +30,8 @@ export function startIngestScheduler() {
   }, 20_000);
 
   startLiveIngest();
+  startWalletTelegram();
+  startPortfolioMilestones();
 
   const calMs = calibrateIntervalMs();
   setTimeout(() => {

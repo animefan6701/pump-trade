@@ -130,6 +130,12 @@ export function WatchDesk() {
             <Link href="/" style={{ color: "var(--acid)", letterSpacing: "0.14em", fontSize: 12 }}>
               ← TAPE
             </Link>
+            <Link href="/analyze" style={{ color: "var(--acid)", letterSpacing: "0.14em", fontSize: 12 }}>
+              ANALYZE →
+            </Link>
+            <Link href="/wallets" style={{ color: "var(--acid)", letterSpacing: "0.14em", fontSize: 12 }}>
+              WALLETS →
+            </Link>
             <Link href="/trades" style={{ color: "var(--acid)", letterSpacing: "0.14em", fontSize: 12 }}>
               FILLS →
             </Link>

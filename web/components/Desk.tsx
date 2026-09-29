@@ -307,10 +307,12 @@ function TokenChart({ candles, trades }: { candles: TapeCandle[]; trades: TapeTr
 
 function TokenAccordion({
   mint,
+  refreshAt,
   onScored,
   onWatchChange,
 }: {
   mint: string;
+  refreshAt?: number;
   onScored: (coin: CoinDoc) => void;
   onWatchChange?: (items: WatchItem[]) => void;
 }) {
@@ -339,7 +341,7 @@ function TokenAccordion({
     return () => {
       dead = true;
     };
-  }, [mint]);
+  }, [mint, refreshAt]);
 
   if (loading) {
     return (
@@ -490,6 +492,7 @@ export function Desk() {
   const [loading, setLoading] = useState(true);
   const [openMint, setOpenMint] = useState<string | null>(null);
   const [scoringMint, setScoringMint] = useState<string | null>(null);
+  const [tapeRev, setTapeRev] = useState(0);
   const [now, setNow] = useState(() => Date.now());
   const [notices, setNotices] = useState<NoticeStore>(emptyNotices);
   const [bellOpen, setBellOpen] = useState(false);
@@ -665,6 +668,7 @@ export function Desk() {
       const body = await r.json();
       if (!r.ok || !body.coin) throw new Error(body.error || "rescore failed");
       applyScored(body.coin);
+      if (openMintRef.current === mint) setTapeRev((n) => n + 1);
     } catch (e) {
       setError(e instanceof Error ? e.message : "rescore failed");
     } finally {
@@ -935,6 +939,12 @@ export function Desk() {
                   : "ingest has not run yet"}
               </p>
               <div style={{ display: "flex", gap: 16, justifyContent: "flex-end", marginTop: 10 }}>
+                <Link href="/analyze" style={{ color: "var(--acid)", letterSpacing: "0.14em", fontSize: 12 }}>
+                  ANALYZE →
+                </Link>
+                <Link href="/wallets" style={{ color: "var(--acid)", letterSpacing: "0.14em", fontSize: 12 }}>
+                  WALLETS →
+                </Link>
                 <Link href="/watch" style={{ color: "var(--acid)", letterSpacing: "0.14em", fontSize: 12 }}>
                   WATCH LIST →
                 </Link>
@@ -1034,7 +1044,7 @@ export function Desk() {
         })}
         <button
           onClick={() => void pullNow()}
-          disabled={pulling || job?.running}
+          disabled={pulling}
           style={{
             border: "1px solid var(--acid)",
             background: "transparent",
@@ -1043,7 +1053,7 @@ export function Desk() {
             cursor: "pointer",
           }}
         >
-          {pulling || job?.running ? "PULLING…" : "PULL NOW"}
+          {pulling ? "PULLING…" : "PULL NOW"}
         </button>
         <input
           value={query}
@@ -1219,6 +1229,7 @@ export function Desk() {
                   {open && (
                     <TokenAccordion
                       mint={row.mint}
+                      refreshAt={tapeRev}
                       onScored={applyScored}
                       onWatchChange={(items) => {
                         setWatch(items);

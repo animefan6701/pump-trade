@@ -3,15 +3,12 @@ import { coins, jobs, scores } from "./mongo";
 import { enrichMeltLive } from "./meltLive";
 import {
   attachGeckoToPairs,
-  captureMissingLaunchTapes,
   fetchGeckoPools,
   isVirtualBook,
-  needsLaunchTape,
   pairScore,
   pumpCurveReserve,
   type DexPair,
 } from "./tape";
-import { fetchMoonLaunches } from "./moonIngest";
 import { scoreAndUpsert } from "./upsert";
 import type { IngestJobDoc, LaunchSnapshot } from "./types";
 
@@ -40,6 +37,7 @@ const DEX_VENUE: Record<string, string> = {
 };
 
 let running = false;
+let runningAt = 0;
 
 function intervalMs() {
   return Math.max(60_000, Number(process.env.INGEST_INTERVAL_MS || 3_600_000));
@@ -172,17 +170,10 @@ export async function fetchNewLaunches(): Promise<{
     geckoRows = [];
   }
 
-  let moonRows: LaunchSnapshot[] = [];
-  try {
-    moonRows = (await fetchMoonLaunches({ backfillMin: 45 })).snaps;
-  } catch {
-    moonRows = [];
-  }
-
   const blocked = await blacklistMints();
   const seen = new Set<string>();
   const snaps: LaunchSnapshot[] = [];
-  for (const snap of [...pumpRows, ...moonRows, ...geckoRows]) {
+  for (const snap of [...pumpRows, ...geckoRows]) {
     if (blocked.has(snap.mint) || seen.has(snap.mint)) continue;
     seen.add(snap.mint);
     snaps.push(snap);
@@ -194,7 +185,7 @@ export async function fetchNewLaunches(): Promise<{
 
   return {
     snaps,
-    sources: { pumpfun: pumpRows.length, moonshot: moonRows.length, geckoterminal: geckoRows.length },
+    sources: { pumpfun: pumpRows.length, geckoterminal: geckoRows.length },
   };
 }
 
@@ -281,7 +272,7 @@ async function enrichCreatorCounts(snaps: LaunchSnapshot[]) {
 }
 
 export async function runIngestCycle(): Promise<IngestJobDoc> {
-  if (running) {
+  if (running && Date.now() - runningAt < 90_000) {
     const existing = await (await jobs()).findOne({ _id: "ingest" });
     return (
       existing || {
@@ -297,6 +288,7 @@ export async function runIngestCycle(): Promise<IngestJobDoc> {
   }
 
   running = true;
+  runningAt = Date.now();
   const now = new Date();
   const next = new Date(now.getTime() + intervalMs()).toISOString();
   const col = await coins();
@@ -328,41 +320,6 @@ export async function runIngestCycle(): Promise<IngestJobDoc> {
     const { snaps, sources } = await fetchNewLaunches();
     result.sources = sources;
 
-    const needTape: LaunchSnapshot[] = [];
-    for (const snap of snaps) {
-      const existing = await col.findOne(
-        { mint: snap.mint },
-        {
-          projection: {
-            source: 1,
-            launchSnipers: 1,
-            complete: 1,
-            migrateAt: 1,
-            launchedAt: 1,
-            launchTapeAt: 1,
-            tapeTries: 1,
-            nextTapeAt: 1,
-          },
-        },
-      );
-      if (existing?.source === "melt") continue;
-      if (needsLaunchTape(existing)) {
-        snap.tapeTries = existing?.tapeTries;
-        snap.launchTapeAt = existing?.launchTapeAt;
-        snap.nextTapeAt = existing?.nextTapeAt;
-        needTape.push(snap);
-      }
-    }
-    const taped = await captureMissingLaunchTapes(needTape, 8, 3);
-    result.sources = {
-      ...sources,
-      tape: taped.tried,
-      tapeTrades: taped.trades,
-      tapeSnipers: taped.snipers,
-      tapePump: taped.pump,
-      tapeHelius: taped.helius,
-    };
-
     for (const snap of snaps) {
       const existing = await col.findOne({ mint: snap.mint });
       if (existing?.source === "melt") {
@@ -390,7 +347,17 @@ export async function runIngestCycle(): Promise<IngestJobDoc> {
 }
 
 export async function getIngestStatus(): Promise<IngestJobDoc | null> {
-  return (await jobs()).findOne({ _id: "ingest" });
+  const job = await (await jobs()).findOne({ _id: "ingest" });
+  const stale =
+    Boolean(job?.running) &&
+    (!running ||
+      Boolean(job?.lastRunAt && Date.now() - new Date(job.lastRunAt).getTime() > 90_000));
+  if (job && stale) {
+    job.running = false;
+    if (!running) running = false;
+    await (await jobs()).updateOne({ _id: "ingest" }, { $set: { running: false } });
+  }
+  return job;
 }
 
 export { intervalMs };

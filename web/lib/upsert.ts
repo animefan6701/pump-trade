@@ -14,6 +14,7 @@ import {
 import { appendMigrateBar, migrateLockFields, resolveMigrateEntryProb, scoreManipProxy } from "./migrateSeries";
 import { pickSniperFeatures } from "./meltLive";
 import { coins, migrateSeries } from "./mongo";
+import { ANALYZE_TARGETS } from "./analyzeTypes";
 import { scoreLaunch } from "./predict";
 import { logScore } from "./scores";
 import { maybeAutoTrade } from "./trader";
@@ -52,7 +53,7 @@ export async function scoreAndUpsert(
   }
   const lockedSnipers = pickSniperFeatures(snap.launchSnipers);
   if (lockedSnipers) snap.melt = { ...snap.melt, ...lockedSnipers };
-  snap.complete = Boolean(snap.complete || existing?.complete);
+  if (snap.complete == null && existing?.complete) snap.complete = existing.complete;
   if (snap.holders == null && existing?.holders) snap.holders = existing.holders;
   if (snap.reserveUsd == null && existing?.liquidityUsd) {
     const mc = snap.usdMarketCap || existing.marketCapUsd || 0;
@@ -312,6 +313,19 @@ export async function scoreAndUpsert(
       ];
     }
   }
+  const analyzeHits = { ...(existing?.analyzeHits || {}) };
+  const liveMcNow = scored.marketCapUsd || 0;
+  const prevMc = existing?.marketCapUsd || 0;
+  const t0 = snap.launchedAt || existing?.launchedAt;
+  for (const tg of ANALYZE_TARGETS) {
+    if (analyzeHits[tg.key]?.at) continue;
+    if (liveMcNow >= tg.usd && prevMc < tg.usd) {
+      analyzeHits[tg.key] = {
+        at: ts,
+        durationMs: t0 ? Math.max(0, Date.now() - new Date(t0).getTime()) : undefined,
+      };
+    }
+  }
   void logScore(scored, source);
   const launchSnipers =
     existing?.launchSnipers || pickSniperFeatures(snap.launchSnipers) || pickSniperFeatures(snap.melt);
@@ -335,6 +349,7 @@ export async function scoreAndUpsert(
         ...(typeof tapeTries === "number" ? { tapeTries } : {}),
         ...(nextTapeAt ? { nextTapeAt } : {}),
         ...(typeof snap.quoteMisses === "number" ? { quoteMisses: snap.quoteMisses } : {}),
+        analyzeHits,
         ...lock,
       },
       $setOnInsert: { createdAt: existing?.createdAt || ts },

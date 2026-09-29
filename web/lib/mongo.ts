@@ -10,9 +10,16 @@ import type {
   IngestJobDoc,
   MigrateSeriesDoc,
   PositionDoc,
+  OhlcvCacheDoc,
   ScoreDoc,
   TradeDoc,
   TraderSettings,
+  WalletAlertEventDoc,
+  WalletAlertStateDoc,
+  WalletRankDoc,
+  PortfolioMilestoneEventDoc,
+  PortfolioMilestoneStateDoc,
+  PortfolioMilestoneTokenDoc,
 } from "./types";
 
 loadEnv({ path: resolve(process.cwd(), "../.env") });
@@ -73,4 +80,39 @@ export async function blacklist() {
 
 export async function watchPins() {
   return (await getDb()).collection<WatchPinDoc>("watch_pins");
+}
+
+export async function ohlcvCache() {
+  return (await getDb()).collection<OhlcvCacheDoc>("ohlcv_cache");
+}
+
+export async function walletRanks() {
+  return (await getDb()).collection<WalletRankDoc>("wallet_ranks");
+}
+
+export async function walletAlertState() {
+  return (await getDb()).collection<WalletAlertStateDoc>("wallet_alert_state");
+}
+
+export async function walletAlertEvents() {
+  return (await getDb()).collection<WalletAlertEventDoc>("wallet_alert_events");
+}
+
+export async function portfolioMilestoneState() {
+  return (await getDb()).collection<PortfolioMilestoneStateDoc>("portfolio_milestone_state");
+}
+
+export async function portfolioMilestoneEvents() {
+  return (await getDb()).collection<PortfolioMilestoneEventDoc>("portfolio_milestone_events");
+}
+
+let milestoneTokenIndex = false;
+
+export async function portfolioMilestoneTokens() {
+  const col = (await getDb()).collection<PortfolioMilestoneTokenDoc>("portfolio_milestone_tokens");
+  if (!milestoneTokenIndex) {
+    await col.createIndex({ address: 1, mint: 1 }, { unique: true });
+    milestoneTokenIndex = true;
+  }
+  return col;
 }

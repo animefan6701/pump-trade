@@ -1,9 +1,11 @@
 import type { Filter } from "mongodb";
-import { blacklistMints, notBlacklistedMongo } from "./blacklist";
+import { blacklistMints, isBlacklisted, notBlacklistedMongo } from "./blacklist";
 import { isDumpedCoin, notDumpedMongo } from "./dumped";
 import { enrichMeltLive } from "./meltLive";
 import { coins } from "./mongo";
-import { altQuoteReserveUsd, attachPumpLiveTape, curveReserveUsd, fetchDexQuotes, pumpCoin } from "./tape";
+import { hasFlag } from "./flags";
+import { liveBook, liveBooks, snapFromLiveBook } from "./liveBook";
+import { attachPumpLiveTape } from "./tape";
 import type { CoinDoc, LaunchSnapshot } from "./types";
 import { scoreAndUpsert } from "./upsert";
 import { listWatchPins } from "./watchPins";
@@ -61,19 +63,6 @@ function hotMs() {
   return Math.max(30, Number(process.env.HOT_BOOK_MINUTES || 360)) * 60_000;
 }
 
-function featNum(c: CoinDoc, key: string) {
-  const v = c.features?.[key];
-  return typeof v === "number" ? v : undefined;
-}
-
-function hasQuote(quote?: {
-  marketCapUsd?: number;
-  priceUsd?: number;
-  liquidityUsd?: number;
-}) {
-  return quote != null && (quote.marketCapUsd != null || quote.priceUsd != null || (quote.liquidityUsd ?? 0) > 0);
-}
-
 function isEnter(c: CoinDoc) {
   return c.status === "enter" || (c.flags || []).includes("enter");
 }
@@ -82,96 +71,7 @@ function isWatch(c: CoinDoc) {
   return c.status === "watching" || (c.flags || []).includes("watching");
 }
 
-function snapFromBook(
-  c: CoinDoc,
-  quote?: {
-    priceUsd?: number;
-    pairAddress?: string;
-    liquidityUsd?: number;
-    solUsd?: number;
-    volume5m?: number;
-    volume1h?: number;
-    change5m?: number;
-    change1h?: number;
-    change6h?: number;
-    buys5m?: number;
-    sells5m?: number;
-    marketCapUsd?: number;
-    dex?: string;
-  } | null,
-  pump?: Awaited<ReturnType<typeof pumpCoin>>,
-): LaunchSnapshot {
-  const onCurve = !c.complete && !pump?.complete;
-  const quoteLiq = !onCurve && (quote?.liquidityUsd ?? 0) > 0 ? quote?.liquidityUsd : undefined;
-  const curveLiq =
-    pump && onCurve
-      ? altQuoteReserveUsd({
-          quoteMint: pump.quoteMint,
-          quoteDecimals: pump.quoteDecimals,
-          realQuote: pump.realQuoteReserves,
-          virtualQuote: pump.virtualQuoteReserves,
-          quoteUsd: quote?.solUsd,
-        }) ??
-        pump.curveReserveUsd ??
-        curveReserveUsd({
-          realSolLamports: pump.realSolReserves,
-          virtualSolLamports: pump.virtualSolReserves,
-          solUsd: quote?.solUsd,
-        })
-      : undefined;
-  const pumpMc = pump?.usdMarketCap;
-  const mc = pumpMc || (!onCurve ? quote?.marketCapUsd : undefined) || c.marketCapUsd || 0;
-  const ath = Math.max(c.athMarketCap || 0, c.marketCapUsd || 0, mc);
-  let top10 = featNum(c, "top10");
-  if (typeof top10 === "number" && top10 >= 0.98 && (c.holders ?? 0) >= 80) top10 = undefined;
-  const insiderGraph = featNum(c, "insiderGraph");
-  const quoted = hasQuote(quote || undefined) || pumpMc != null;
-  return {
-    mint: c.mint,
-    venue: c.venue,
-    dex: quote?.dex || c.dex,
-    name: c.name,
-    symbol: c.symbol,
-    creator: c.creator,
-    complete: Boolean(c.complete || pump?.complete || quote?.dex === "pumpswap" || quote?.dex === "raydium"),
-    twitter: pump?.twitter || c.twitter,
-    website: pump?.website || c.website,
-    usdMarketCap: mc,
-    priceUsd: quote?.priceUsd || (mc > 0 ? mc / 1_000_000_000 : undefined) || c.priceUsd,
-    athMarketCap: ath || undefined,
-    launchedAt: c.launchedAt,
-    holders: c.holders,
-    buyers5m: quote?.buys5m,
-    sellers5m: quote?.sells5m,
-    buys5m: quote?.buys5m,
-    sells5m: quote?.sells5m,
-    change5m: quote?.change5m ?? (onCurve ? undefined : c.change5m),
-    change1h: quote?.change1h ?? (onCurve ? undefined : c.change1h),
-    change6h: quote?.change6h ?? (onCurve ? undefined : c.change6h),
-    reserveUsd: (onCurve ? curveLiq : quoteLiq) ?? quoteLiq ?? curveLiq ?? ((c.liquidityUsd ?? 0) > 0 ? c.liquidityUsd : undefined),
-    volume5m: quote?.volume5m,
-    volume1h: quote?.volume1h,
-    realSolReserves: pump?.realSolReserves,
-    poolAddress: quote?.pairAddress || pump?.poolAddress || c.poolAddress,
-    top10HoldPct: top10,
-    devHoldPct: featNum(c, "devHold"),
-    curveHoldPct: featNum(c, "curveHold"),
-    bundleHoldPct: featNum(c, "bundle"),
-    replyCount: featNum(c, "replies") ?? 0,
-    launchSnipers: c.launchSnipers,
-    quoteMisses: quoted ? 0 : (c.quoteMisses || 0) + 1,
-    tape: {
-      buyCount: quote?.buys5m,
-      sellCount: quote?.sells5m,
-    },
-    melt: {
-      insiderGraph: insiderGraph,
-      bundleHoldPct: featNum(c, "bundle") ?? null,
-    },
-  };
-}
-
-/** Keep ENTER / WATCH / MIGRATED books on a fresh Dex quote. */
+/** Keep ENTER / WATCH / MIGRATED books on a liveBook print. */
 export async function refreshHotBooks(
   seen: Set<string>,
   opts?: { enterOnly?: boolean; kind?: DeskRefreshKind },
@@ -218,31 +118,31 @@ export async function refreshHotBooks(
 
   if (!hot.length && !tapeCoins.length) return { refreshed: 0, tape: 0, staleExit: 0 };
 
-  const quoteAge = fast ? { maxAgeMs: deskRefreshMs() } : undefined;
-  const quotes = await fetchDexQuotes(
-    [...new Set([...hot, ...tapeCoins].map((c) => c.mint))],
-    quoteAge,
-  );
-  const needPump = hot;
-  const pumps = new Map<string, Awaited<ReturnType<typeof pumpCoin>>>();
-  await Promise.all(
-    needPump.map(async (c) => {
-      pumps.set(c.mint, await pumpCoin(c.mint, quoteAge).catch(() => null));
-    }),
+  const rows = [...hot, ...tapeCoins.filter((c) => !hot.some((h) => h.mint === c.mint))];
+  const books = await liveBooks(
+    rows.map((c) => ({
+      mint: c.mint,
+      bondingCurve: c.poolAddress,
+      complete: Boolean(c.complete || hasFlag(c, "migrated")),
+      marketCapUsd: c.marketCapUsd || c.athMarketCap,
+    })),
+    { maxAgeMs: fast ? deskRefreshMs() : 5_000 },
   );
   const pending: LaunchSnapshot[] = [];
   for (const c of hot) {
-    const quote = quotes.get(c.mint);
-    const quoted = hasQuote(quote);
+    const book = books.get(c.mint);
+    if (!book) continue;
     seen.add(c.mint);
-    pending.push(snapFromBook(c, quoted ? quote : null, pumps.get(c.mint) || null));
+    pending.push(snapFromLiveBook(c, book));
   }
   const byMint = new Map(pending.map((s) => [s.mint, s]));
   const needTape: LaunchSnapshot[] = [];
   for (const c of tapeCoins) {
     let snap = byMint.get(c.mint);
     if (!snap) {
-      snap = snapFromBook(c, hasQuote(quotes.get(c.mint)) ? quotes.get(c.mint) : null, null);
+      const book = books.get(c.mint);
+      if (!book) continue;
+      snap = snapFromLiveBook(c, book);
       pending.push(snap);
       byMint.set(c.mint, snap);
     }
@@ -286,7 +186,7 @@ export async function listLiveDeskAccounts(): Promise<LiveDeskAccount[]> {
   const pins = await listWatchPins();
   const pinMints = pins.map((p) => p.mint).filter((m) => !blocked.has(m));
   const blockedQ = blocked.size ? { mint: { $nin: [...blocked] } } : {};
-  const [enters, migrated, pinned] = await Promise.all([
+  const [enters, migrated, pinned, launchlab] = await Promise.all([
     col
       .find({ source: "live", $or: [{ flags: "enter" }, { status: "enter" }], ...blockedQ })
       .project({ mint: 1, poolAddress: 1 })
@@ -299,9 +199,15 @@ export async function listLiveDeskAccounts(): Promise<LiveDeskAccount[]> {
       .project({ mint: 1, poolAddress: 1 })
       .toArray(),
     pinMints.length ? col.find({ mint: { $in: pinMints } }).project({ mint: 1, poolAddress: 1 }).toArray() : Promise.resolve([]),
+    col
+      .find({ source: "live", dex: "raydium-launchlab", ...blockedQ })
+      .sort({ updatedAt: -1 })
+      .limit(30)
+      .project({ mint: 1, poolAddress: 1 })
+      .toArray(),
   ]);
   const out = new Map<string, LiveDeskAccount>();
-  for (const row of [...enters, ...migrated, ...pinned]) {
+  for (const row of [...enters, ...migrated, ...pinned, ...launchlab]) {
     out.set(row.mint, { mint: row.mint, poolAddress: row.poolAddress });
   }
   for (const mint of pinMints) {
@@ -316,15 +222,21 @@ export async function refreshMints(mints: string[]) {
   if (!keep.length) return { refreshed: 0, tape: 0, staleExit: 0 };
   const rows = await (await coins()).find({ mint: { $in: keep }, source: "live" }).toArray();
   if (!rows.length) return { refreshed: 0, tape: 0, staleExit: 0 };
-  const quoteAge = { maxAgeMs: liveDeskRefreshMs() };
-  const quotes = await fetchDexQuotes(rows.map((c) => c.mint), quoteAge);
-  const pumps = new Map<string, Awaited<ReturnType<typeof pumpCoin>>>();
-  await Promise.all(
-    rows.map(async (c) => {
-      pumps.set(c.mint, await pumpCoin(c.mint, quoteAge).catch(() => null));
-    }),
+  const books = await liveBooks(
+    rows.map((c) => ({
+      mint: c.mint,
+      bondingCurve: c.poolAddress,
+      complete: Boolean(c.complete || hasFlag(c, "migrated")),
+      marketCapUsd: c.marketCapUsd || c.athMarketCap,
+    })),
+    { maxAgeMs: liveDeskRefreshMs() },
   );
-  const pending = rows.map((c) => snapFromBook(c, hasQuote(quotes.get(c.mint)) ? quotes.get(c.mint) : null, pumps.get(c.mint) || null));
+  const pending = rows
+    .map((c) => {
+      const book = books.get(c.mint);
+      return book ? snapFromLiveBook(c, book) : null;
+    })
+    .filter((s): s is LaunchSnapshot => Boolean(s));
   let refreshed = 0;
   await Promise.all(
     pending.map(async (snap) => {
@@ -344,4 +256,24 @@ export async function refreshLiveDeskBooks() {
   } finally {
     running.liveDesk = false;
   }
+}
+
+/** RESCORE: liveBook with Helius vault confirm. */
+export async function rescoreLiveMint(mint: string) {
+  if (await isBlacklisted(mint)) return null;
+  const existing = await (await coins()).findOne({ mint, source: "live" });
+  if (!existing) return null;
+  const book = await liveBook(mint, {
+    bondingCurve: existing.poolAddress,
+    vault: true,
+    maxAgeMs: 0,
+    marketCapUsd: existing.marketCapUsd || existing.athMarketCap,
+    complete: Boolean(existing.complete || hasFlag(existing, "migrated")),
+  });
+  if (!book) return null;
+  const snap = snapFromLiveBook(existing, book);
+  const wr = await scoreAndUpsert(snap, "live");
+  if (!wr) return null;
+  const ts = new Date().toISOString();
+  return { ...wr.scored, createdAt: existing.createdAt, updatedAt: ts };
 }

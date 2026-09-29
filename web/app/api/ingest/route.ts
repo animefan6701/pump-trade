@@ -38,8 +38,9 @@ export async function GET() {
 }
 
 export async function POST() {
-  const job = await runIngestCycle();
+  void runIngestCycle().catch((err) => console.error("[ingest] pull failed", err));
   void runLivePumpCycle().catch(() => null);
   void runCalibration().catch(() => null);
-  return NextResponse.json({ ok: true, job });
+  const job = await getIngestStatus();
+  return NextResponse.json({ ok: true, job: job ? { ...job, running: true } : { running: true } });
 }

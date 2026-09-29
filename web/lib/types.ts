@@ -65,6 +65,7 @@ export type CoinDoc = {
   bondingAt?: string;
   prevBonding?: number;
   bondingVelocity?: number;
+  analyzeHits?: Partial<Record<string, { at: string; durationMs?: number }>>;
   createdAt: string;
   updatedAt: string;
 };
@@ -407,3 +408,196 @@ export type ApiKeyDoc = {
 };
 
 export type PublicApiKey = Omit<ApiKeyDoc, "key"> & { last4: string; active?: boolean };
+
+export type PumpBook = {
+  mint: string;
+  name?: string;
+  symbol?: string;
+  creator?: string;
+  complete: boolean;
+  bondingCurve?: string;
+  swapPool?: string;
+  poolAddress?: string;
+  quoteMint?: string;
+  quoteDecimals: number;
+  usdMarketCap?: number;
+  athMarketCap?: number;
+  solUsd?: number;
+  twitter?: string;
+  website?: string;
+  realQuoteReserves?: number;
+  realSolReserves?: number;
+};
+
+export type DexBook = {
+  pairAddress?: string;
+  dex?: string;
+  name?: string;
+  symbol?: string;
+  twitter?: string;
+  priceUsd?: number;
+  marketCapUsd?: number;
+  liquidityUsd?: number;
+  solUsd?: number;
+  volume5m?: number;
+  volume1h?: number;
+  change5m?: number;
+  change1h?: number;
+  change6h?: number;
+  buys5m?: number;
+  sells5m?: number;
+};
+
+export type LiveBook = {
+  mint: string;
+  complete: boolean;
+  onCurve: boolean;
+  usdMarketCap: number;
+  priceUsd?: number;
+  athMarketCap?: number;
+  reserveUsd: number;
+  realQuoteReserves?: number;
+  realSolReserves?: number;
+  quoteMint?: string;
+  quoteDecimals?: number;
+  bondingCurve?: string;
+  poolAddress?: string;
+  name?: string;
+  symbol?: string;
+  creator?: string;
+  twitter?: string;
+  website?: string;
+  dex?: string;
+  volume5m?: number;
+  volume1h?: number;
+  change5m?: number;
+  change1h?: number;
+  change6h?: number;
+  buys5m?: number;
+  sells5m?: number;
+  lpSource: "helius" | "pump" | "dex" | "none";
+  mcSource: "pump" | "dex" | "none";
+};
+
+export type OhlcvBar = {
+  t: number;
+  o: number;
+  h: number;
+  l: number;
+  c: number;
+  v?: number;
+};
+
+export type OhlcvCacheDoc = {
+  mint: string;
+  pool?: string;
+  tf: "hour" | "day";
+  bars: OhlcvBar[];
+  supply?: number;
+  fetchedAt: string;
+};
+
+export type WalletWindow = {
+  buy: number;
+  sell: number;
+  trades: number;
+  winrate: number;
+  pnl: number;
+  realizedUsd: number;
+  costUsd: number;
+  hit500: number;
+  hit2x: number;
+  tokens: number;
+};
+
+export type WalletAlertKind = "FIRST BUY" | "BUY MORE" | "SELL ALL" | "SELL PARTIAL";
+
+export type WalletAlertStateDoc = {
+  address: string;
+  primed: boolean;
+  seen: string[];
+  bags: Record<string, boolean>;
+  updatedAt: string;
+};
+
+export type WalletAlertEventDoc = {
+  address: string;
+  kind: WalletAlertKind;
+  mint: string;
+  symbol?: string;
+  tx: string;
+  usd?: number;
+  mc?: number;
+  at: string;
+};
+
+export type PortfolioMilestoneToken = {
+  symbol: string;
+  entry: number;
+  hit: number[];
+};
+
+export type PortfolioMilestoneStateDoc = {
+  address: string;
+  primed: boolean;
+  tokens: Record<string, PortfolioMilestoneToken>;
+  updatedAt: string;
+};
+
+export type PortfolioMilestoneRangeStatus = {
+  sent: boolean;
+  level: number;
+  multiple: number;
+  at: string;
+};
+
+export type PortfolioMilestoneTokenDoc = {
+  address: string;
+  mint: string;
+  symbol: string;
+  entry: number;
+  entryMc: number;
+  cost: number;
+  amount: number;
+  usd: number;
+  price: number;
+  mc: number;
+  multiple: number;
+  range: string;
+  notified: Record<string, PortfolioMilestoneRangeStatus>;
+  lastNotified?: string;
+  lastNotifiedAt?: string;
+  updatedAt: string;
+};
+
+export type PortfolioMilestoneEventDoc = {
+  address: string;
+  mint: string;
+  symbol?: string;
+  label: string;
+  level: number;
+  entry: number;
+  entryMc?: number;
+  price: number;
+  mc?: number;
+  multiple: number;
+  amount: number;
+  usd: number;
+  at: string;
+};
+
+export type WalletRankDoc = {
+  address: string;
+  chain: string;
+  name?: string;
+  tags: string[];
+  twitter?: string;
+  d7: WalletWindow;
+  d30: WalletWindow;
+  all: WalletWindow;
+  qualify: boolean;
+  reasons: string[];
+  fetchedAt: string;
+  createdAt: string;
+  updatedAt: string;
+};

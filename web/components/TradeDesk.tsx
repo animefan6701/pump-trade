@@ -332,12 +332,17 @@ export function TradeDesk() {
           <p style={{ margin: "10px 0 0", color: "var(--mute)", fontSize: 11 }}>
             {settings?.enabled ? "AUTO ARMED" : "AUTO OFF"} · max {settings?.maxOpen ?? 20} books
           </p>
-          <Link
-            href="/"
-            style={{ display: "inline-block", marginTop: 12, color: "var(--acid)", letterSpacing: "0.14em", fontSize: 12 }}
-          >
-            ← TAPE
-          </Link>
+          <div style={{ display: "flex", gap: 16, justifyContent: "flex-end", marginTop: 12 }}>
+            <Link href="/" style={{ color: "var(--acid)", letterSpacing: "0.14em", fontSize: 12 }}>
+              ← TAPE
+            </Link>
+            <Link href="/analyze" style={{ color: "var(--acid)", letterSpacing: "0.14em", fontSize: 12 }}>
+              ANALYZE →
+            </Link>
+            <Link href="/wallets" style={{ color: "var(--acid)", letterSpacing: "0.14em", fontSize: 12 }}>
+              WALLETS →
+            </Link>
+          </div>
         </div>
       </header>
       {error && <p style={{ color: "var(--rust)" }}>{error}</p>}

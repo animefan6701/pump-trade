@@ -90,9 +90,17 @@ export function KeysDesk() {
             KEYS
           </h1>
         </div>
-        <Link href="/" style={{ color: "var(--acid)", letterSpacing: "0.14em", fontSize: 12 }}>
-          ← TAPE
-        </Link>
+        <div style={{ display: "flex", gap: 16 }}>
+          <Link href="/" style={{ color: "var(--acid)", letterSpacing: "0.14em", fontSize: 12 }}>
+            ← TAPE
+          </Link>
+          <Link href="/analyze" style={{ color: "var(--acid)", letterSpacing: "0.14em", fontSize: 12 }}>
+            ANALYZE →
+          </Link>
+          <Link href="/wallets" style={{ color: "var(--acid)", letterSpacing: "0.14em", fontSize: 12 }}>
+            WALLETS →
+          </Link>
+        </div>
       </header>
       <form onSubmit={(e) => void add(e)} style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 24 }}>
         <input value={key} onChange={(e) => setKey(e.target.value)} placeholder="api key" style={{ minWidth: 240 }} />

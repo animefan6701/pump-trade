@@ -82,6 +82,16 @@ export function quoteIsSol(mint?: string) {
   return !q || q === WSOL || q === NATIVE_SOL;
 }
 
+const USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+const USDT = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB";
+
+/** USD price of a known stable quote. Do not pass Dex solUsd here. */
+export function stableQuoteUsd(mint?: string) {
+  const q = (mint || "").trim();
+  if (q === USDC || q === USDT) return 1;
+  return undefined;
+}
+
 export type DexPair = {
   chainId?: string;
   dexId?: string;
@@ -171,26 +181,59 @@ export function altQuoteReserveUsd(opts: {
   quoteUsd?: number;
 }) {
   if (quoteIsSol(opts.quoteMint)) return undefined;
-  const px = opts.quoteUsd;
+  const px = opts.quoteUsd ?? stableQuoteUsd(opts.quoteMint);
   if (!px || px <= 0 || px >= 50) return undefined;
+  if (opts.realQuote == null) return undefined;
   const dec = Math.min(12, Math.max(0, opts.quoteDecimals ?? 6));
   const scale = 10 ** dec;
-  const real = (opts.realQuote || 0) / scale;
-  const virt = (opts.virtualQuote || 0) / scale;
-  const units = Math.max(real * 2, virt);
-  return units > 0 ? units * px : undefined;
+  const real = opts.realQuote / scale;
+  // Cash TVL = real quote × 2. Virtual is the bonding-curve k, not LP.
+  return real > 0 ? real * 2 * px : 0;
+}
+
+export function pumpBookLiq(
+  pump?: {
+    quoteMint?: string;
+    quoteDecimals?: number;
+    realQuoteReserves?: number;
+    virtualQuoteReserves?: number;
+    realSolReserves?: number;
+    virtualSolReserves?: number;
+    curveReserveUsd?: number;
+    complete?: boolean;
+  } | null,
+  opts?: { solUsd?: number; quoteLiq?: number; onCurve?: boolean },
+) {
+  if (!pump) return opts?.quoteLiq;
+  const onCurve = opts?.onCurve ?? !pump.complete;
+  if (!onCurve) return opts?.quoteLiq;
+  const alt = altQuoteReserveUsd({
+    quoteMint: pump.quoteMint,
+    quoteDecimals: pump.quoteDecimals,
+    realQuote: pump.realQuoteReserves,
+    quoteUsd: stableQuoteUsd(pump.quoteMint),
+  });
+  if (alt !== undefined) return alt;
+  return (
+    curveReserveUsd({
+      realSolLamports: pump.realSolReserves,
+      virtualSolLamports: pump.virtualSolReserves,
+      solUsd: opts?.solUsd,
+    }) ?? pump.curveReserveUsd
+  );
 }
 
 export function pumpCurveReserve(row: Record<string, unknown>, quoteTokenUsd?: number) {
   if (row.complete) return undefined;
   const quoteMint = String(row.quote_mint || "");
   if (!quoteIsSol(quoteMint)) {
+    const raw = row.real_quote_reserves ?? row.real_sol_reserves;
+    if (raw == null || raw === "") return undefined;
     return altQuoteReserveUsd({
       quoteMint,
       quoteDecimals: Number(row.quote_decimals || 6),
-      realQuote: Number(row.real_quote_reserves || row.real_sol_reserves || 0),
-      virtualQuote: Number(row.virtual_quote_reserves || row.virtual_sol_reserves || 0),
-      quoteUsd: quoteTokenUsd,
+      realQuote: Number(raw),
+      quoteUsd: quoteTokenUsd ?? stableQuoteUsd(quoteMint),
     });
   }
   return curveReserveUsd({
@@ -265,6 +308,32 @@ export function dexQuote(pairs: DexPair[]) {
 }
 
 type DexQuote = NonNullable<ReturnType<typeof dexQuote>>;
+type GeckoQuote = {
+  pairAddress: string;
+  dex?: string;
+  priceUsd?: number;
+  marketCapUsd?: number;
+  liquidityUsd?: number;
+  volume5m?: number;
+  volume1h?: number;
+  change5m?: number;
+  change1h?: number;
+  change6h?: number;
+  buys5m?: number;
+  sells5m?: number;
+};
+type LaunchQuote = {
+  mint: string;
+  pairAddress: string;
+  dex: string;
+  name?: string;
+  symbol?: string;
+  twitter?: string;
+  priceUsd?: number;
+  marketCapUsd?: number;
+  liquidityUsd?: number;
+  quoteMint?: string;
+};
 type CacheEntry<T> = { at: number; value: T };
 
 function quoteTtlMs() {
@@ -272,6 +341,9 @@ function quoteTtlMs() {
 }
 
 const dexCache = new Map<string, CacheEntry<DexQuote>>();
+const geckoCache = new Map<string, CacheEntry<GeckoQuote | null>>();
+const launchCache = new Map<string, CacheEntry<LaunchQuote | null>>();
+const solUsdCache = new Map<string, CacheEntry<number | null>>();
 const pumpCache = new Map<string, CacheEntry<Awaited<ReturnType<typeof fetchPumpCoin>>>>();
 
 function cacheGet<T>(map: Map<string, CacheEntry<T>>, key: string, maxAgeMs?: number): T | undefined {
@@ -369,20 +441,29 @@ async function fetchPumpCoin(mint: string) {
   try {
     const row = (await getJson(`https://frontend-api-v3.pump.fun/coins/${mint}`, 8_000)) as Record<string, unknown>;
     if (!row || !row.mint) return null;
-    const pool = row.raydium_pool
+    const swapPool = row.raydium_pool
       ? String(row.raydium_pool)
       : row.pump_swap_pool
         ? String(row.pump_swap_pool)
         : undefined;
-    const migrated = Boolean(row.complete) || Boolean(pool);
+    const bondingCurve = row.bonding_curve ? String(row.bonding_curve) : undefined;
+    const migrated = Boolean(row.complete);
     const quoteMint = row.quote_mint ? String(row.quote_mint) : undefined;
     const solish = quoteIsSol(quoteMint);
     const reserves = Number(row.real_sol_reserves || row.real_quote_reserves || 0);
     const virtualSol = Number(row.virtual_sol_reserves || row.virtual_quote_reserves || 0);
+    const usdMc = Number(row.usd_market_cap || row.market_cap_usd || 0) || undefined;
+    const mcSol = Number(row.market_cap || 0) || undefined;
     return {
-      usdMarketCap: Number(row.usd_market_cap || row.market_cap_usd || 0) || undefined,
+      name: row.name ? String(row.name) : undefined,
+      symbol: row.symbol ? String(row.symbol) : undefined,
+      creator: row.creator ? String(row.creator) : undefined,
+      usdMarketCap: usdMc,
+      solUsd: usdMc && mcSol && mcSol > 0 ? usdMc / mcSol : undefined,
       complete: migrated,
-      poolAddress: pool,
+      bondingCurve,
+      swapPool,
+      poolAddress: migrated || swapPool ? swapPool || bondingCurve : bondingCurve || swapPool,
       quoteMint,
       quoteDecimals: Number(row.quote_decimals || (solish ? 9 : 6)),
       realQuoteReserves: Number(row.real_quote_reserves || row.real_sol_reserves || 0) || undefined,
@@ -414,6 +495,8 @@ export type GeckoPoolRow = {
   attributes?: {
     reserve_in_usd?: string;
     fdv_usd?: string;
+    market_cap_usd?: string;
+    token_price_usd?: string;
     volume_usd?: { m5?: string; h24?: string; h6?: string; h1?: string };
     price_change_percentage?: { m5?: string; h1?: string; h6?: string };
     transactions?: { m5?: { buys?: number; sells?: number } };
@@ -437,10 +520,14 @@ function geckoQuoteFromRow(row?: GeckoPoolRow) {
   const ch = row.attributes?.price_change_percentage;
   const vol = row.attributes?.volume_usd;
   const tx = row.attributes?.transactions?.m5;
+  const px = Number(row.attributes?.token_price_usd || 0);
+  const mc = Number(row.attributes?.market_cap_usd || 0) || fdv;
   return {
     pool: geckoPoolAddr(row.id),
     reserveUsd: liq > 0 ? liq : undefined,
     fdvUsd: fdv > 0 ? fdv : undefined,
+    priceUsd: px > 0 ? px : undefined,
+    marketCapUsd: mc > 0 ? mc : undefined,
     dex: row.relationships?.dex?.data?.id,
     volume5m: Number(vol?.m5 || 0) || undefined,
     volume1h: Number(vol?.h1 || 0) || undefined,
@@ -450,6 +537,117 @@ function geckoQuoteFromRow(row?: GeckoPoolRow) {
     buys5m: tx?.buys,
     sells5m: tx?.sells,
   };
+}
+
+export async function fetchGeckoQuote(mint: string, poolAddress?: string, opts?: { maxAgeMs?: number }) {
+  const key = `${mint}:${poolAddress || ""}`;
+  const hit = cacheGet(geckoCache, key, opts?.maxAgeMs);
+  if (hit !== undefined) return hit;
+  const g = geckoQuoteFromRow(pickGeckoRow(await fetchGeckoPools(mint), poolAddress));
+  const quote = g
+    ? {
+        pairAddress: g.pool || "",
+        dex: g.dex,
+        priceUsd: g.priceUsd,
+        marketCapUsd: g.marketCapUsd || g.fdvUsd,
+        liquidityUsd: g.reserveUsd,
+        volume5m: g.volume5m,
+        volume1h: g.volume1h,
+        change5m: g.change5m,
+        change1h: g.change1h,
+        change6h: g.change6h,
+        buys5m: g.buys5m,
+        sells5m: g.sells5m,
+      }
+    : null;
+  if (quote) cacheSet(geckoCache, key, quote);
+  return quote;
+}
+
+export async function fetchSolUsd(opts?: { maxAgeMs?: number }) {
+  const hit = cacheGet(solUsdCache, "sol", opts?.maxAgeMs);
+  if (hit !== undefined) return hit || undefined;
+  try {
+    const body = (await getJson(
+      `https://api-v3.raydium.io/mint/price?mints=${WSOL}`,
+      8_000,
+    )) as { data?: Record<string, string> };
+    const px = Number(body.data?.[WSOL] || 0);
+    const ok = px >= 10 && px <= 5_000 ? px : null;
+    cacheSet(solUsdCache, "sol", ok);
+    return ok || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function asLaunchQuote(row?: {
+  mint?: string;
+  poolId?: string;
+  name?: string;
+  symbol?: string;
+  twitter?: string;
+  marketCap?: number;
+  supply?: number;
+  mintB?: { address?: string };
+}): LaunchQuote | null {
+  if (!row?.mint) return null;
+  const mc = Number(row.marketCap || 0);
+  const supply = Number(row.supply || 0);
+  return {
+    mint: row.mint,
+    pairAddress: String(row.poolId || ""),
+    dex: "raydium-launchlab",
+    name: row.name,
+    symbol: row.symbol,
+    twitter: row.twitter,
+    marketCapUsd: mc > 0 ? mc : undefined,
+    priceUsd: mc > 0 && supply > 0 ? mc / supply : undefined,
+    quoteMint: row.mintB?.address,
+  };
+}
+
+export async function fetchLaunchMints(mints: string[], opts?: { maxAgeMs?: number }) {
+  const out = new Map<string, LaunchQuote>();
+  const need: string[] = [];
+  for (const mint of mints) {
+    if (!mint) continue;
+    const ageMs = opts?.maxAgeMs === 0 ? 0 : Math.max(opts?.maxAgeMs ?? quoteTtlMs(), 8_000);
+    const hit = cacheGet(launchCache, mint, ageMs);
+    if (hit !== undefined) {
+      if (hit) out.set(mint, hit);
+      continue;
+    }
+    need.push(mint);
+  }
+  const chunk = 20;
+  for (let i = 0; i < need.length; i += chunk) {
+    const part = need.slice(i, i + chunk);
+    try {
+      const body = (await getJson(
+        `https://launch-mint-v1.raydium.io/get/by/mints?ids=${part.join(",")}`,
+        8_000,
+      )) as { data?: { rows?: Parameters<typeof asLaunchQuote>[0][] } };
+      const seen = new Set<string>();
+      for (const row of body.data?.rows || []) {
+        const q = asLaunchQuote(row);
+        if (!q) continue;
+        cacheSet(launchCache, q.mint, q);
+        out.set(q.mint, q);
+        seen.add(q.mint);
+      }
+      for (const mint of part) {
+        if (!seen.has(mint)) cacheSet(launchCache, mint, null);
+      }
+    } catch {
+      /* retry next cycle */
+    }
+  }
+  return out;
+}
+
+export async function fetchLaunchMint(mint: string, opts?: { maxAgeMs?: number }) {
+  return (await fetchLaunchMints([mint], opts)).get(mint) || null;
 }
 
 export async function fetchGeckoPools(mint: string): Promise<GeckoPoolRow[]> {
@@ -892,12 +1090,60 @@ export async function attachPumpLiveTape(snaps: LaunchSnapshot[], cap = 16) {
   return attached;
 }
 
-export async function loadTokenTape(mint: string, opts?: { rescore?: boolean }) {
+/** Desk accordion: liveBook + Pump trades. */
+async function loadLiveTokenView(mint: string, existing: CoinDoc | null) {
+  const { liveBook, snapFromLiveBook } = await import("./liveBook");
+  const [book, trades] = await Promise.all([
+    liveBook(mint, {
+      bondingCurve: existing?.poolAddress,
+      vault: true,
+      maxAgeMs: 0,
+      marketCapUsd: existing?.marketCapUsd || existing?.athMarketCap,
+      complete: Boolean(existing?.complete || (existing?.flags || []).includes("migrated")),
+    }),
+    pumpSwapTrades(mint, existing?.creator).catch(() => [] as TapeTrade[]),
+  ]);
+  const tape = tapeFromTrades(trades, [], existing?.creator);
+  let coin: CoinDoc | null = existing;
+  if (existing && book && existing.source !== "melt") {
+    const snap = { ...snapFromLiveBook(existing, book), tape, launchSnipers: existing.launchSnipers, launchSigs: existing.launchSigs };
+    const wr = await scoreAndUpsert(snap, "live");
+    const ts = new Date().toISOString();
+    if (wr) coin = { ...wr.scored, createdAt: existing.createdAt || ts, updatedAt: ts };
+  } else if (coin && book) {
+    coin = {
+      ...coin,
+      marketCapUsd: book.usdMarketCap || coin.marketCapUsd,
+      priceUsd: book.priceUsd || coin.priceUsd,
+      liquidityUsd: book.reserveUsd,
+      updatedAt: new Date().toISOString(),
+    };
+  }
+
+  return {
+    coin,
+    candles: [] as TapeCandle[],
+    trades,
+    quote: book
+      ? {
+          priceUsd: book.priceUsd,
+          liquidityUsd: book.reserveUsd,
+          pairAddress: book.poolAddress,
+        }
+      : undefined,
+    tape,
+  };
+}
+
+export async function loadTokenTape(mint: string, opts?: { rescore?: boolean; view?: boolean }) {
   if (await isBlacklisted(mint)) {
     return { coin: null, candles: [] as TapeCandle[], trades: [] as TapeTrade[] };
   }
   const col = await coins();
   const existing = await col.findOne({ mint });
+  if (opts?.view) {
+    return loadLiveTokenView(mint, existing);
+  }
   const [dexBody, pump, trades, geckoRows] = await Promise.all([
     getJson(`https://api.dexscreener.com/latest/dex/tokens/${mint}`).catch(() => ({ pairs: [] })),
     pumpCoin(mint, { maxAgeMs: 0 }),
@@ -986,16 +1232,11 @@ export async function loadTokenTape(mint: string, opts?: { rescore?: boolean }) 
       change6h: geckoBook ? gecko.change6h ?? quote?.change6h : quote?.change6h,
       reserveUsd: geckoBook
         ? gecko.reserveUsd ?? quote?.liquidityUsd
-        : (quote?.liquidityUsd && quote.liquidityUsd > 0 ? quote.liquidityUsd : undefined) ??
-          gecko.reserveUsd ??
-          altQuoteReserveUsd({
-            quoteMint: pump?.quoteMint,
-            quoteDecimals: pump?.quoteDecimals,
-            realQuote: pump?.realQuoteReserves,
-            virtualQuote: pump?.virtualQuoteReserves,
-            quoteUsd: quote?.solUsd,
-          }) ??
-          pump?.curveReserveUsd,
+        : pumpBookLiq(pump, {
+            onCurve: !(pump?.complete || existing?.complete),
+            solUsd: quote?.solUsd,
+            quoteLiq: quote?.liquidityUsd && quote.liquidityUsd > 0 ? quote.liquidityUsd : gecko.reserveUsd,
+          }),
       volume5m: geckoBook ? gecko.volume5m ?? quote?.volume5m : quote?.volume5m,
       volume1h: geckoBook ? gecko.volume1h ?? quote?.volume1h : quote?.volume1h,
       holders:

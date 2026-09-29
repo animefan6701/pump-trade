@@ -11,7 +11,7 @@ export async function GET(req: Request, ctx: Ctx) {
   if (!mint) return NextResponse.json({ error: "mint required" }, { status: 400 });
   const view = new URL(req.url).searchParams.get("view") === "1";
   try {
-    const tape = await loadTokenTape(mint, { rescore: !view });
+    const tape = await loadTokenTape(mint, { view, rescore: !view });
     return NextResponse.json(tape);
   } catch (e) {
     return NextResponse.json(

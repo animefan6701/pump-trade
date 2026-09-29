@@ -4,96 +4,17 @@ import { enrichMeltLive } from "./meltLive";
 import type { Filter } from "mongodb";
 import { coins, jobs } from "./mongo";
 import { isDumpedCoin, notDumpedMongo } from "./dumped";
-import { altQuoteReserveUsd, dexQuote, fetchDexQuotes, pumpCoin } from "./tape";
+import { liveBooks, snapFromLiveBook } from "./liveBook";
 import type { CoinDoc, IngestJobDoc, LaunchSnapshot } from "./types";
 import { scoreAndUpsert } from "./upsert";
 
-const PUMP_CONCURRENCY = 8;
 const CHUNK = 200;
-
-type DexQuote = NonNullable<ReturnType<typeof dexQuote>>;
-
-function num(v: unknown): number | undefined {
-  return typeof v === "number" && Number.isFinite(v) ? v : undefined;
-}
-
-function poisonedCluster(c: CoinDoc) {
-  return (c.reasons || []).some((r) => /tape cluster|clustered top-10|jito/i.test(r));
-}
 
 function needsHolderRefresh(snap: LaunchSnapshot) {
   const mc = snap.usdMarketCap ?? 0;
   const liq = snap.reserveUsd ?? 0;
   const vol = snap.volume5m ?? 0;
   return Boolean(snap.complete || mc >= 15_000 || (liq >= 80 && vol >= 400) || (snap.change5m ?? 0) >= 25);
-}
-
-function coinSnap(c: CoinDoc, pump: Awaited<ReturnType<typeof pumpCoin>>, quote: DexQuote | null): LaunchSnapshot {
-  const feat = c.features || {};
-  const quoteLiq = quote != null && (quote.liquidityUsd ?? 0) > 0 ? quote.liquidityUsd : undefined;
-  const curveLiq =
-    altQuoteReserveUsd({
-      quoteMint: pump?.quoteMint,
-      quoteDecimals: pump?.quoteDecimals,
-      realQuote: pump?.realQuoteReserves,
-      virtualQuote: pump?.virtualQuoteReserves,
-      quoteUsd: quote?.solUsd,
-    }) ?? pump?.curveReserveUsd;
-  const dustQuote = quote != null && quoteLiq == null && curveLiq == null;
-  const mc = pump?.usdMarketCap || quote?.marketCapUsd || (dustQuote ? 0 : c.marketCapUsd);
-  const complete = pump?.complete ?? c.complete;
-  const staleLiq =
-    c.liquidityUsd && (mc ?? 0) > 0 && c.liquidityUsd > (mc ?? 0) * 8 ? undefined : c.liquidityUsd;
-  const liq = quoteLiq ?? curveLiq ?? staleLiq;
-  const holders = num(feat.holders) ?? c.holders;
-  const top10 = num(feat.top10);
-  const dropBook = (holders ?? 0) <= 2 && (complete || (mc ?? 0) >= 15_000);
-  const dropBundle = poisonedCluster(c);
-
-  return {
-    mint: c.mint,
-    venue: c.venue || "pump.fun",
-    dex: quote?.dex || c.dex,
-    name: c.name,
-    symbol: c.symbol,
-    creator: c.creator,
-    complete,
-    usdMarketCap: mc,
-    priceUsd: quote?.priceUsd || c.priceUsd,
-    athMarketCap: Math.max(c.athMarketCap || 0, pump?.athMarketCap || 0, mc || 0) || undefined,
-    launchedAt: c.launchedAt,
-    poolAddress: quote?.pairAddress || pump?.poolAddress || c.poolAddress,
-    realSolReserves: complete ? undefined : pump?.realSolReserves,
-    buyers5m: quote?.buys5m,
-    sellers5m: quote?.sells5m,
-    buys5m: quote?.buys5m,
-    sells5m: quote?.sells5m,
-    change5m: quote?.change5m ?? c.change5m,
-    change1h: quote?.change1h,
-    change6h: quote?.change6h,
-    reserveUsd: liq,
-    volume5m: quote?.volume5m ?? c.volume5m,
-    volume1h: quote?.volume1h ?? c.volume1h,
-    holders: dropBook ? undefined : holders,
-    replyCount: num(feat.replies) ?? 0,
-    top10HoldPct: dropBook || (top10 !== undefined && top10 > 1) ? undefined : top10,
-    devHoldPct: num(feat.devHold),
-    bundleHoldPct: dropBundle ? undefined : num(feat.bundle),
-    curveHoldPct: dropBook ? undefined : num(feat.curveHold),
-  };
-}
-
-async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
-  const out: R[] = new Array(items.length);
-  let i = 0;
-  async function worker() {
-    while (i < items.length) {
-      const idx = i++;
-      out[idx] = await fn(items[idx]);
-    }
-  }
-  await Promise.all(Array.from({ length: Math.min(limit, items.length) || 1 }, () => worker()));
-  return out;
 }
 
 export function rescoreIntervalMs() {
@@ -184,12 +105,20 @@ export async function rescoreRejected(opts: { limit?: number; mode?: RescoreMode
 
     for (let start = 0; start < rows.length; start += CHUNK) {
       const batch = rows.slice(start, start + CHUNK);
-      const quotes = await fetchDexQuotes(batch.map((r) => r.mint));
-      const pumps = await mapLimit(batch, PUMP_CONCURRENCY, (c) => pumpCoin(c.mint).catch(() => null));
+      const books = await liveBooks(
+        batch.map((c) => ({
+          mint: c.mint,
+          bondingCurve: c.poolAddress,
+          complete: Boolean(c.complete || (c.flags || []).includes("migrated")),
+          marketCapUsd: c.marketCapUsd || c.athMarketCap,
+        })),
+      );
       const snaps: LaunchSnapshot[] = [];
       const refresh: LaunchSnapshot[] = [];
-      for (let i = 0; i < batch.length; i++) {
-        const snap = coinSnap(batch[i], pumps[i], quotes.get(batch[i].mint) || null);
+      for (const c of batch) {
+        const book = books.get(c.mint);
+        if (!book) continue;
+        const snap = snapFromLiveBook(c, book);
         snaps.push(snap);
         if (needsHolderRefresh(snap)) refresh.push(snap);
       }
@@ -210,7 +139,7 @@ export async function rescoreRejected(opts: { limit?: number; mode?: RescoreMode
             result.flipped[next] = (result.flipped[next] || 0) + 1;
           }
         } catch (e) {
-          result.errors.push(`${batch[i].mint}: ${e instanceof Error ? e.message : String(e)}`);
+          result.errors.push(`${snaps[i].mint}: ${e instanceof Error ? e.message : String(e)}`);
         }
       }
 
